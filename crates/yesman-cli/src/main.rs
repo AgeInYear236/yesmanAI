@@ -7,11 +7,14 @@ use std::{
 use anyhow::Result;
 use clap::Parser;
 use yesman_model::{
-    Config, DType, GenerationConfig, GenerateOptions, Qwen2, Sampler, Tokenizer, chat, chat_once,
+    Config, DType, GenerateOptions, GenerationConfig, Qwen2, Sampler, Tokenizer, chat, chat_once,
 };
 
 #[derive(Parser, Debug)]
-#[command(name = "yesman", about = "Qwen2.5 inference, pure Rust, no ML frameworks")]
+#[command(
+    name = "yesman",
+    about = "Qwen2.5 inference, pure Rust, no ML frameworks"
+)]
 struct Args {
     /// Directory with config.json / tokenizer.json / model.safetensors
     #[arg(short, long, default_value = "models/Qwen2.5-1.5B-Instruct")]
@@ -69,6 +72,10 @@ struct Args {
     /// Quantize, save to this cache and exit (build once, start fast after)
     #[arg(long)]
     save_cache: Option<PathBuf>,
+
+    /// Calculate perplexity on the provided text file and exit
+    #[arg(long)]
+    perplexity: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -89,7 +96,13 @@ fn main() -> Result<()> {
 
     if args.print_ids {
         let ids = tok.encode(&prompt_text(&args))?;
-        println!("{}", ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(","));
+        println!(
+            "{}",
+            ids.iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
         return Ok(());
     }
 
@@ -105,13 +118,52 @@ fn main() -> Result<()> {
         cfg.hidden_size,
         cfg.num_attention_heads,
         cfg.num_key_value_heads,
-        if args.cache.is_some() { "cached" } else { dtype.name() },
+        if args.cache.is_some() {
+            "cached"
+        } else {
+            dtype.name()
+        },
         t0.elapsed().as_secs_f32()
     );
 
     if let Some(p) = &args.save_cache {
         model.save_cache(p)?;
-        eprintln!("saved quant cache to {} ({:.2}s total)", p.display(), t0.elapsed().as_secs_f32());
+        eprintln!(
+            "saved quant cache to {} ({:.2}s total)",
+            p.display(),
+            t0.elapsed().as_secs_f32()
+        );
+        return Ok(());
+    }
+
+    if let Some(p) = &args.perplexity {
+        let text = std::fs::read_to_string(p)?;
+        let ids = tok.encode(&text)?;
+        if ids.len() < 2 {
+            anyhow::bail!("corpus has fewer than 2 tokens; cannot compute perplexity");
+        }
+        let max_ctx = model.max_ctx();
+        let eval_ids = if ids.len() > max_ctx {
+            eprintln!(
+                "warning: corpus length ({} tokens) exceeds model max_ctx ({}); evaluating first {} tokens",
+                ids.len(),
+                max_ctx,
+                max_ctx
+            );
+            &ids[..max_ctx]
+        } else {
+            &ids[..]
+        };
+        let t_eval = Instant::now();
+        let (nll, count) = model.compute_nll(eval_ids)?;
+        let elapsed = t_eval.elapsed().as_secs_f64();
+        let ppl = (nll / count as f64).exp();
+        let bpc = nll / (count as f64 * std::f64::consts::LN_2);
+        eprintln!(
+            "evaluated {count} tokens in {elapsed:.2}s ({:.1} tok/s): nll={nll:.4}, bpc={bpc:.3}",
+            count as f64 / elapsed.max(1e-6)
+        );
+        println!("perplexity: {ppl:.4}");
         return Ok(());
     }
 
@@ -123,7 +175,11 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let opts = GenerateOptions { max_new_tokens: args.max_tokens, max_ctx: args.ctx, ..Default::default() };
+    let opts = GenerateOptions {
+        max_new_tokens: args.max_tokens,
+        max_ctx: args.ctx,
+        ..Default::default()
+    };
 
     if let Some(p) = &args.prompt {
         let messages = if args.raw {
@@ -138,7 +194,9 @@ fn main() -> Result<()> {
     // --- interactive REPL -----------------------------------------------------
     let mut history: Vec<chat::Message> = vec![system_message(&args)];
     let stdin = io::stdin();
-    println!("yesman — Qwen2.5 в чистом Rust. Пустая строка или /exit — выход.\n");
+    println!(
+        "yesman — Qwen2.5 в чистом Rust. Пустая строка или /exit — выход, /reset — сброс истории.\n"
+    );
     loop {
         print!("> ");
         io::stdout().flush()?;
@@ -150,6 +208,12 @@ fn main() -> Result<()> {
         if line.is_empty() || line == "/exit" || line == "/quit" {
             break;
         }
+        if line == "/reset" || line == "/clear" {
+            history = vec![system_message(&args)];
+            model.reset();
+            println!("История диалога и KV-кэш сброшены.\n");
+            continue;
+        }
         history.push(chat::user(line.to_string()));
         let reply = print_reply(&mut model, &tok, &cfg, &history, &opts, &mut sampler)?;
         history.push(chat::assistant(reply));
@@ -159,7 +223,11 @@ fn main() -> Result<()> {
 }
 
 fn system_message(args: &Args) -> chat::Message {
-    chat::system(args.system.clone().unwrap_or_else(|| chat::DEFAULT_SYSTEM.to_string()))
+    chat::system(
+        args.system
+            .clone()
+            .unwrap_or_else(|| chat::DEFAULT_SYSTEM.to_string()),
+    )
 }
 
 fn prompt_text(args: &Args) -> String {
@@ -202,7 +270,11 @@ fn print_reply(
 
 fn top_n(logits: &[f32], n: usize) {
     let mut order: Vec<usize> = (0..logits.len()).collect();
-    order.sort_unstable_by(|a, b| logits[*b].partial_cmp(&logits[*a]).unwrap());
+    order.sort_unstable_by(|a, b| {
+        logits[*b]
+            .partial_cmp(&logits[*a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     for id in order.into_iter().take(n) {
         println!("{}\t{:.6}", id, logits[id]);
     }

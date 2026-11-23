@@ -11,8 +11,8 @@ pub struct Tokenizer {
 impl Tokenizer {
     pub fn from_dir(dir: &Path) -> Result<Self> {
         let p = dir.join("tokenizer.json");
-        let inner = HfTokenizer::from_file(&p)
-            .map_err(|e| anyhow::anyhow!("load {}: {e}", p.display()))?;
+        let inner =
+            HfTokenizer::from_file(&p).map_err(|e| anyhow::anyhow!("load {}: {e}", p.display()))?;
         Ok(Self { inner })
     }
 

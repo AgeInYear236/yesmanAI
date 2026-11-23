@@ -29,19 +29,31 @@ fn main() {
     for _ in 0..reps {
         ops::matmul(&mut out, &x, &w, 1, k, n);
     }
-    report("f32  ", (n * k * 4) as f64 / 1e9, t.elapsed().as_secs_f64() / reps as f64);
+    report(
+        "f32  ",
+        (n * k * 4) as f64 / 1e9,
+        t.elapsed().as_secs_f64() / reps as f64,
+    );
 
     let t = Instant::now();
     for _ in 0..reps {
         bf16::matmul(&mut out, &x, &bw, 1, k, n);
     }
-    report("bf16 ", (n * k * 2) as f64 / 1e9, t.elapsed().as_secs_f64() / reps as f64);
+    report(
+        "bf16 ",
+        (n * k * 2) as f64 / 1e9,
+        t.elapsed().as_secs_f64() / reps as f64,
+    );
 
     let t = Instant::now();
     for _ in 0..reps {
         quant::matmul_q8(&mut out, &xq, &qw, 1, k, n);
     }
-    report("q8_0 ", (n * k) as f64 / 1e9, t.elapsed().as_secs_f64() / reps as f64);
+    report(
+        "q8_0 ",
+        (n * k) as f64 / 1e9,
+        t.elapsed().as_secs_f64() / reps as f64,
+    );
     println!("(checksum {} values, last {})", out.len(), out[n - 1]);
 }
 

@@ -57,7 +57,10 @@ pub struct CacheEntry<'a> {
 }
 
 pub fn write_cache(path: &Path, entries: &[CacheEntry<'_>]) -> Result<()> {
-    let mut toc = Header { entries: HashMap::new(), layout: LAYOUT };
+    let mut toc = Header {
+        entries: HashMap::new(),
+        layout: LAYOUT,
+    };
     let mut offset = 0u64;
     for e in entries {
         toc.entries.insert(
@@ -75,7 +78,7 @@ pub fn write_cache(path: &Path, entries: &[CacheEntry<'_>]) -> Result<()> {
     }
 
     let toc_bytes = serde_json::to_vec(&toc)?;
-    let data_start = (HEADER_LEN + toc_bytes.len() + ALIGN - 1) / ALIGN * ALIGN;
+    let data_start = (HEADER_LEN + toc_bytes.len()).div_ceil(ALIGN) * ALIGN;
 
     // Stream straight from the entries: no giant intermediate Vec.
     let mut f = std::io::BufWriter::with_capacity(1 << 20, File::create(path)?);
@@ -117,7 +120,12 @@ impl QuantCache {
         let toc_len = u64::from_le_bytes(mmap[16..24].try_into()?) as usize;
         let base = u64::from_le_bytes(mmap[24..32].try_into()?) as usize;
         let toc: Header = serde_json::from_slice(&mmap[HEADER_LEN..HEADER_LEN + toc_len])?;
-        Ok(Self { mmap, toc: toc.entries, layout: toc.layout, base })
+        Ok(Self {
+            mmap,
+            toc: toc.entries,
+            layout: toc.layout,
+            base,
+        })
     }
 
     pub fn has(&self, name: &str) -> bool {

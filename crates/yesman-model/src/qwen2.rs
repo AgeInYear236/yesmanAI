@@ -6,14 +6,17 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use rayon::prelude::*;
 use yesman_core::{
-    Bf16Tensor, Q4KTensor, Q4Tensor, Q8Tensor, SafeFile, Tensor, bf16, cache, ops, q4, q4k,
-    quant,
+    Bf16Tensor, Q4KTensor, Q4Tensor, Q8Tensor, SafeFile, Tensor, bf16, cache, ops, q4, q4k, quant,
 };
 
 use crate::{config::Config, kv::KvCache};
+
+/// Maximum tokens evaluated in one prefill step. Long prompts are chunked
+/// to keep peak attention memory bounded (prevents O(seq_len^2) scratchpad explosion).
+pub const PREFILL_CHUNK: usize = 512;
 
 /// How weights are held in memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -74,9 +77,7 @@ impl Weight {
             DType::Bf16 => Weight::BF16(file.get_bf16(name)?),
             DType::Q8 => Weight::Q8(Q8Tensor::from_bf16(&file.get_bf16(name)?)),
             DType::Q4 => Weight::Q4(Q4Tensor::from_bf16(&file.get_bf16(name)?)),
-            DType::Q4K | DType::Q4KM => {
-                Weight::Q4K(Q4KTensor::from_bf16(&file.get_bf16(name)?))
-            }
+            DType::Q4K | DType::Q4KM => Weight::Q4K(Q4KTensor::from_bf16(&file.get_bf16(name)?)),
         })
     }
 
@@ -250,7 +251,7 @@ impl Qwen2 {
                     "embed shape {other:?} contradicts config {}x{}",
                     cfg.vocab_size,
                     cfg.hidden_size
-                ))
+                ));
             }
         }
         // Q4 noise on the 152k-row tied embedding/lm_head dominates the logit
@@ -275,7 +276,9 @@ impl Qwen2 {
             let p = format!("model.layers.{i}");
             layers.push(Layer {
                 in_norm: file.get(&format!("{p}.input_layernorm.weight"))?.data,
-                post_norm: file.get(&format!("{p}.post_attention_layernorm.weight"))?.data,
+                post_norm: file
+                    .get(&format!("{p}.post_attention_layernorm.weight"))?
+                    .data,
                 wq: Weight::load(&file, &format!("{p}.self_attn.q_proj.weight"), dt)?,
                 wk: Weight::load(&file, &format!("{p}.self_attn.k_proj.weight"), dt)?,
                 wv: Weight::load(&file, &format!("{p}.self_attn.v_proj.weight"), dt)?,
@@ -293,7 +296,16 @@ impl Qwen2 {
         let kv = KvCache::new(cfg.num_hidden_layers, max_ctx, cfg.kv_dim());
 
         let ws = Workspace::new(&cfg);
-        Ok(Self { cfg, embed, final_norm, layers, cos, sin, kv, ws })
+        Ok(Self {
+            cfg,
+            embed,
+            final_norm,
+            layers,
+            cos,
+            sin,
+            kv,
+            ws,
+        })
     }
 
     /// Load from a pre-quantized cache produced by [`Qwen2::save_cache`].
@@ -310,7 +322,7 @@ impl Qwen2 {
                     "cached embed shape {other:?} contradicts config {}x{}",
                     cfg.vocab_size,
                     cfg.hidden_size
-                ))
+                ));
             }
         }
         let embed = Weight::from_cache(&c, "model.embed_tokens.weight")?;
@@ -338,7 +350,16 @@ impl Qwen2 {
         let (cos, sin) = ops::rope_tables(max_ctx, cfg.head_dim(), cfg.rope_theta);
         let kv = KvCache::new(cfg.num_hidden_layers, max_ctx, cfg.kv_dim());
         let ws = Workspace::new(&cfg);
-        Ok(Self { cfg, embed, final_norm, layers, cos, sin, kv, ws })
+        Ok(Self {
+            cfg,
+            embed,
+            final_norm,
+            layers,
+            cos,
+            sin,
+            kv,
+            ws,
+        })
     }
 
     /// Write every tensor (weights + norms + biases) to a reusable cache.
@@ -373,15 +394,18 @@ impl Qwen2 {
             });
         }
 
-        fn push_weight<'a>(
-            specs: &mut Vec<Spec<'a>>,
-            name: String,
-            w: &'a Weight,
-        ) -> Result<()> {
-            let (kind, rows, cols, _) = w
-                .cache_bytes()
-                .ok_or_else(|| anyhow!("save_cache requires quantized weights (--dtype q8|q4|q4k)"))?;
-            specs.push(Spec { name, kind, rows, cols, small: None, weight: Some(w) });
+        fn push_weight<'a>(specs: &mut Vec<Spec<'a>>, name: String, w: &'a Weight) -> Result<()> {
+            let (kind, rows, cols, _) = w.cache_bytes().ok_or_else(|| {
+                anyhow!("save_cache requires quantized weights (--dtype q8|q4|q4k)")
+            })?;
+            specs.push(Spec {
+                name,
+                kind,
+                rows,
+                cols,
+                small: None,
+                weight: Some(w),
+            });
             Ok(())
         }
 
@@ -389,7 +413,12 @@ impl Qwen2 {
         let mut specs: Vec<Spec<'_>> = Vec::new();
 
         push_weight(&mut specs, "model.embed_tokens.weight".into(), &self.embed)?;
-        push_small(&mut specs, &mut small, "model.norm.weight".into(), &self.final_norm);
+        push_small(
+            &mut specs,
+            &mut small,
+            "model.norm.weight".into(),
+            &self.final_norm,
+        );
 
         for (i, l) in self.layers.iter().enumerate() {
             let p = format!("model.layers.{i}");
@@ -439,13 +468,17 @@ impl Qwen2 {
         self.kv.len()
     }
 
+    pub fn max_ctx(&self) -> usize {
+        self.kv.max()
+    }
+
     pub fn reset(&mut self) {
         self.kv.clear();
     }
 
-    /// Run `tokens` starting at absolute position `pos0` and return the logits
-    /// for the last token. K/V for these tokens is appended to the cache.
-    pub fn forward(&mut self, tokens: &[u32], pos0: usize) -> Vec<f32> {
+    /// Run a slice of tokens of length up to `PREFILL_CHUNK` through the transformer layers,
+    /// storing K/V in the cache and leaving the final hidden states in `ws.x`.
+    fn forward_layers(&mut self, tokens: &[u32], pos0: usize) {
         let m = tokens.len();
         assert!(m > 0);
         let cfg = &self.cfg;
@@ -457,7 +490,6 @@ impl Qwen2 {
         let group = cfg.gqa_group();
         let eps = cfg.rms_norm_eps;
         let scale = 1.0 / (hd as f32).sqrt();
-        let vocab = cfg.vocab_size;
         let profiling = std::env::var_os("YESMAN_PROFILE").is_some();
         let mut prof = Profile::default();
         let now = || std::time::Instant::now();
@@ -480,7 +512,6 @@ impl Qwen2 {
         let cos = &self.cos;
         let sin = &self.sin;
         let embed = &self.embed;
-        let final_norm = &self.final_norm;
 
         let t_max = pos0 + m;
         ws.ensure(m, h, inter, kv_dim);
@@ -614,20 +645,119 @@ impl Qwen2 {
         }
 
         kv.set_len(pos0 + m);
-
-        // --- lm_head (tied embeddings) ---------------------------------------
-        let xf = &mut ws.xf[..h];
-        ops::rmsnorm(xf, &x[(m - 1) * h..m * h], final_norm, eps);
-        let logits = &mut ws.logits[..vocab];
-        embed.matmul(logits, xf, 1, h, vocab);
-        lap!(head);
         if profiling {
             let _ = mark;
             prof.dump();
         }
+    }
+
+    /// Single chunk forward step: passes up to `PREFILL_CHUNK` tokens through the
+    /// layers and returns logits for the last token.
+    pub fn forward_step(&mut self, tokens: &[u32], pos0: usize) -> Vec<f32> {
+        let m = tokens.len();
+        assert!(m > 0);
+        self.forward_layers(tokens, pos0);
+        let h = self.cfg.hidden_size;
+        let vocab = self.cfg.vocab_size;
+        let eps = self.cfg.rms_norm_eps;
+        let xf = &mut self.ws.xf[..h];
+        ops::rmsnorm(xf, &self.ws.x[(m - 1) * h..m * h], &self.final_norm, eps);
+        let logits = &mut self.ws.logits[..vocab];
+        self.embed.matmul(logits, xf, 1, h, vocab);
         logits.to_vec()
     }
 
+    /// Chunked forward pass: splits long prompts into chunks of `chunk_size`
+    /// to cap peak scratchpad memory and avoid OOM, returning logits for the last token.
+    pub fn forward_chunked(&mut self, tokens: &[u32], pos0: usize, chunk_size: usize) -> Vec<f32> {
+        assert!(chunk_size > 0);
+        if tokens.len() <= chunk_size {
+            return self.forward_step(tokens, pos0);
+        }
+        let mut pos = pos0;
+        let mut logits = Vec::new();
+        for chunk in tokens.chunks(chunk_size) {
+            logits = self.forward_step(chunk, pos);
+            pos += chunk.len();
+        }
+        logits
+    }
+
+    /// Run `tokens` starting at absolute position `pos0` and return the logits
+    /// for the last token. K/V for these tokens is appended to the cache.
+    ///
+    /// Long prompts are automatically processed in chunks of [`PREFILL_CHUNK`]
+    /// so memory for attention scores scales with chunk size instead of sequence length.
+    pub fn forward(&mut self, tokens: &[u32], pos0: usize) -> Vec<f32> {
+        self.forward_chunked(tokens, pos0, PREFILL_CHUNK)
+    }
+
+    /// Compute Negative Log-Likelihood (NLL) and count of predicted tokens
+    /// over `tokens` by evaluating each next-token prediction in chunks.
+    ///
+    /// The KV cache is reset at the start.
+    pub fn compute_nll(&mut self, tokens: &[u32]) -> Result<(f64, usize)> {
+        let n = tokens.len();
+        if n < 2 {
+            return Ok((0.0, 0));
+        }
+        if n > self.kv.max() {
+            bail!(
+                "sequence length {n} exceeds model max_ctx {}",
+                self.kv.max()
+            );
+        }
+        self.reset();
+        let h = self.cfg.hidden_size;
+        let vocab = self.cfg.vocab_size;
+        let eps = self.cfg.rms_norm_eps;
+
+        let mut total_nll = 0.0f64;
+        let mut count = 0usize;
+        let mut pos = 0usize;
+
+        for chunk in tokens.chunks(PREFILL_CHUNK) {
+            let m = chunk.len();
+            self.forward_layers(chunk, pos);
+
+            for j in 0..m {
+                let global_idx = pos + j;
+                if global_idx + 1 < n {
+                    let target = tokens[global_idx + 1] as usize;
+                    let xf = &mut self.ws.xf[..h];
+                    ops::rmsnorm(xf, &self.ws.x[j * h..(j + 1) * h], &self.final_norm, eps);
+                    let logits = &mut self.ws.logits[..vocab];
+                    self.embed.matmul(logits, xf, 1, h, vocab);
+
+                    let mut max_logit = f32::NEG_INFINITY;
+                    for &v in logits.iter() {
+                        if v > max_logit {
+                            max_logit = v;
+                        }
+                    }
+                    let mut sum_exp = 0.0f64;
+                    for &v in logits.iter() {
+                        sum_exp += ((v - max_logit) as f64).exp();
+                    }
+                    let log_prob = (logits[target] - max_logit) as f64 - sum_exp.ln();
+                    total_nll += -log_prob;
+                    count += 1;
+                }
+            }
+            pos += m;
+        }
+
+        Ok((total_nll, count))
+    }
+
+    /// Compute perplexity over `tokens`.
+    pub fn perplexity(&mut self, tokens: &[u32]) -> Result<f32> {
+        let (nll, count) = self.compute_nll(tokens)?;
+        if count == 0 {
+            bail!("cannot compute perplexity: sequence has fewer than 2 tokens");
+        }
+        Ok((nll / count as f64).exp() as f32)
+    }
 }
 
 #[derive(Default)]
@@ -655,7 +785,6 @@ impl Profile {
     }
 }
 
-
 fn cache_shape(c: &cache::QuantCache, name: &str) -> Result<Vec<usize>> {
     let e = c.entry(name)?;
     Ok(vec![e.rows, e.cols])
@@ -663,6 +792,9 @@ fn cache_shape(c: &cache::QuantCache, name: &str) -> Result<Vec<usize>> {
 
 fn add_bias(out: &mut [f32], bias: &[f32]) {
     let n = bias.len();
-    out.par_chunks_mut(n)
-        .for_each(|row| for (v, b) in row.iter_mut().zip(bias) { *v += b; });
+    out.par_chunks_mut(n).for_each(|row| {
+        for (v, b) in row.iter_mut().zip(bias) {
+            *v += b;
+        }
+    });
 }

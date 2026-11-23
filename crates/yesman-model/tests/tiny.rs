@@ -45,10 +45,16 @@ fn quantized_forward_stays_close() {
         .iter()
         .zip(want.iter())
         .fold(0.0f32, |a, (g, w)| a.max((g - w).abs()));
-    println!("Q8_0 max deviation: {worst} ({:.2}% of max |logit| {max_abs})", 100.0 * worst / max_abs);
+    println!(
+        "Q8_0 max deviation: {worst} ({:.2}% of max |logit| {max_abs})",
+        100.0 * worst / max_abs
+    );
     // A 64-wide random model is the worst case for block quantization; the real
     // 1.5B checkpoint behaves far better. We only guard against gross errors.
-    assert!(worst < 0.05 * max_abs, "Q8_0 deviation too large: {worst} vs {max_abs}");
+    assert!(
+        worst < 0.05 * max_abs,
+        "Q8_0 deviation too large: {worst} vs {max_abs}"
+    );
 }
 
 #[test]
@@ -74,8 +80,14 @@ fn bf16_forward_stays_close() {
         .iter()
         .zip(want.iter())
         .fold(0.0f32, |a, (g, w)| a.max((g - w).abs()));
-    println!("bf16 max deviation: {worst} ({:.3}% of max |logit|)", 100.0 * worst / max_abs);
-    assert!(worst < 0.01 * max_abs, "bf16 deviation too large: {worst} vs {max_abs}");
+    println!(
+        "bf16 max deviation: {worst} ({:.3}% of max |logit|)",
+        100.0 * worst / max_abs
+    );
+    assert!(
+        worst < 0.01 * max_abs,
+        "bf16 deviation too large: {worst} vs {max_abs}"
+    );
 }
 
 /// Q4_0 (4-bit weights, 8-bit activations) must stay within a few % of f32.
@@ -89,11 +101,17 @@ fn q4_forward_stays_close() {
         .iter()
         .zip(want.iter())
         .fold(0.0f32, |a, (g, w)| a.max((g - w).abs()));
-    println!("Q4_0 max deviation: {worst} ({:.2}% of max |logit|)", 100.0 * worst / max_abs);
+    println!(
+        "Q4_0 max deviation: {worst} ({:.2}% of max |logit|)",
+        100.0 * worst / max_abs
+    );
     // Q4_0 on a 64-wide random model is a worst case (blocks are tiny and the
     // logits are uncalibrated); the test guards against a broken kernel, not
     // quantization noise. On the real checkpoint Q4_0 still answers correctly.
-    assert!(worst < 0.35 * max_abs, "Q4_0 deviation too large: {worst} vs {max_abs}");
+    assert!(
+        worst < 0.35 * max_abs,
+        "Q4_0 deviation too large: {worst} vs {max_abs}"
+    );
 }
 
 /// Q4_K (4-bit weights with per-32 scale/min) must be closer than Q4_0.
@@ -103,8 +121,18 @@ fn q4k_forward_stays_close() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/tiny256");
     let raw = std::fs::read_to_string(dir.join("expected.json")).unwrap();
     let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    let ids: Vec<u32> = v["ids"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect();
-    let want: Vec<f32> = v["logits"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect();
+    let ids: Vec<u32> = v["ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_u64().unwrap() as u32)
+        .collect();
+    let want: Vec<f32> = v["logits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_f64().unwrap() as f32)
+        .collect();
 
     let mut m = Qwen2::from_dir(&dir, 128, DType::Q4K).unwrap();
     let got = m.forward(&ids, 0);
@@ -113,12 +141,18 @@ fn q4k_forward_stays_close() {
         .iter()
         .zip(want.iter())
         .fold(0.0f32, |a, (g, w)| a.max((g - w).abs()));
-    println!("Q4_K max deviation: {worst} ({:.2}% of max |logit|)", 100.0 * worst / max_abs);
+    println!(
+        "Q4_K max deviation: {worst} ({:.2}% of max |logit|)",
+        100.0 * worst / max_abs
+    );
     // The 1-layer random model has uncalibrated logits where correlated
     // rounding noise dominates; kernel-level accuracy is asserted in
     // yesman-core's q4k tests instead. Here we only guard against garbage.
     assert!(got.iter().all(|v| v.is_finite()));
-    assert!(worst < 0.35 * max_abs, "Q4_K deviation too large: {worst} vs {max_abs}");
+    assert!(
+        worst < 0.35 * max_abs,
+        "Q4_K deviation too large: {worst} vs {max_abs}"
+    );
 }
 
 /// Saving quantized weights to the cache and loading them back must give
@@ -129,7 +163,8 @@ fn quant_cache_roundtrip() {
     for dt in [DType::Q8, DType::Q4K, DType::Q4KM] {
         let mut m = Qwen2::from_dir(&dir, 128, dt).unwrap();
         let want = m.forward(&[5, 7, 11, 13], 0);
-        let path = std::env::temp_dir().join(format!("yesman_cache_{}_{:?}.ymq", std::process::id(), dt));
+        let path =
+            std::env::temp_dir().join(format!("yesman_cache_{}_{:?}.ymq", std::process::id(), dt));
         m.save_cache(&path).unwrap();
         let mut loaded = Qwen2::from_cache(&dir, 128, &path).unwrap();
         let got = loaded.forward(&[5, 7, 11, 13], 0);
@@ -158,4 +193,45 @@ fn incremental_decode_matches_prefill() {
         assert!((a - b).abs() < tol, "logit {i}: prefill={a} stepwise={b}");
     }
     assert_eq!(stepwise.kv_len(), ids.len());
+}
+
+/// Chunked prefill (e.g. chunk size 2 on a 6-token prompt) must give
+/// the exact same logits as unchunked prefill.
+#[test]
+fn chunked_prefill_matches_unchunked() {
+    let (ids, _) = fixture();
+    let mut m_unchunked = model();
+    let want = m_unchunked.forward_chunked(&ids, 0, ids.len());
+
+    let mut m_chunked = model();
+    let got = m_chunked.forward_chunked(&ids, 0, 2);
+
+    assert_eq!(m_chunked.kv_len(), ids.len());
+    for (i, (w, g)) in want.iter().zip(got.iter()).enumerate() {
+        let tol = 1e-4 + 1e-5 * w.abs();
+        assert!((w - g).abs() < tol, "logit {i}: unchunked={w} chunked={g}");
+    }
+}
+
+/// Verify that perplexity computation works, gives positive finite PPL,
+/// and that sequence length > max_ctx is rejected.
+#[test]
+fn compute_nll_and_perplexity() {
+    let (ids, _) = fixture();
+    let mut m = model();
+    let (nll, count) = m.compute_nll(&ids).unwrap();
+    assert_eq!(count, ids.len() - 1);
+    assert!(nll > 0.0 && nll.is_finite());
+    let ppl = m.perplexity(&ids).unwrap();
+    assert!(ppl > 1.0 && ppl.is_finite());
+
+    // Single token should yield 0 predicted
+    let (nll_one, count_one) = m.compute_nll(&[ids[0]]).unwrap();
+    assert_eq!(count_one, 0);
+    assert_eq!(nll_one, 0.0);
+    assert!(m.perplexity(&[ids[0]]).is_err());
+
+    // Sequence longer than max_ctx (64 for tiny model)
+    let too_long: Vec<u32> = (0..100).map(|i| (i % 20) as u32).collect();
+    assert!(m.compute_nll(&too_long).is_err());
 }

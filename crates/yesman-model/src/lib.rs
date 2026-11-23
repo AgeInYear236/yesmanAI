@@ -10,6 +10,6 @@ pub mod tokenizer;
 
 pub use config::{Config, GenerationConfig};
 pub use generate::{GenerateOptions, chat_once, generate};
-pub use qwen2::{DType, Qwen2};
+pub use qwen2::{DType, PREFILL_CHUNK, Qwen2};
 pub use sampler::Sampler;
 pub use tokenizer::Tokenizer;

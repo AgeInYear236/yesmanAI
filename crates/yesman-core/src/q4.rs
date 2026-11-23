@@ -28,10 +28,7 @@ impl Q4Tensor {
     pub fn from_f32(data: &[f32], rows: usize, cols: usize) -> Self {
         assert_eq!(data.len(), rows * cols);
         assert_eq!(cols % BLOCK, 0);
-        let blocks = data
-            .par_chunks(cols)
-            .flat_map(|row| quantize_row(row))
-            .collect();
+        let blocks = data.par_chunks(cols).flat_map(quantize_row).collect();
         Self { blocks, rows, cols }
     }
 
@@ -45,7 +42,11 @@ impl Q4Tensor {
                 quantize_row(&f)
             })
             .collect();
-        Self { blocks, rows: t.rows, cols: t.cols }
+        Self {
+            blocks,
+            rows: t.rows,
+            cols: t.cols,
+        }
     }
 
     /// Construct from the raw bytes of a `Vec<BlockQ4>` (cache file), copying.
@@ -63,10 +64,7 @@ impl Q4Tensor {
     pub fn as_bytes(&self) -> &[u8] {
         let size = std::mem::size_of::<BlockQ4>();
         unsafe {
-            std::slice::from_raw_parts(
-                self.blocks.as_ptr() as *const u8,
-                self.blocks.len() * size,
-            )
+            std::slice::from_raw_parts(self.blocks.as_ptr() as *const u8, self.blocks.len() * size)
         }
     }
 
@@ -174,14 +172,7 @@ unsafe fn dot_row_avx2(a: &[BlockQ8], b: &[BlockQ4]) -> f32 {
 ///
 /// Same work splitting as the other matmuls: decode (`m = 1`) needs output
 /// columns distributed across rayon workers or 19/20 cores would idle.
-pub fn matmul_q8q4(
-    out: &mut [f32],
-    xq: &[BlockQ8],
-    w: &Q4Tensor,
-    m: usize,
-    k: usize,
-    n: usize,
-) {
+pub fn matmul_q8q4(out: &mut [f32], xq: &[BlockQ8], w: &Q4Tensor, m: usize, k: usize, n: usize) {
     assert_eq!(w.cols, k);
     assert!(out.len() >= m * n);
     let bpr = k / BLOCK;
@@ -214,7 +205,11 @@ mod tests {
     fn quantize_roundtrip_within_step() {
         let x: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) * 0.37).collect();
         let blocks = quantize_row(&x);
-        let t = Q4Tensor { blocks: blocks.clone(), rows: 2, cols: 32 };
+        let t = Q4Tensor {
+            blocks: blocks.clone(),
+            rows: 2,
+            cols: 32,
+        };
         let got = t.dequantize_row(0);
         let amax = x[..32].iter().fold(0.0f32, |a, &v| a.max(v.abs()));
         let step = amax / 8.0;
@@ -252,7 +247,11 @@ mod tests {
         let mut got = vec![0.0; 4];
         matmul_q8q4(&mut got, &xq, &q4, 1, k, 4);
         for (j, g) in got.iter().enumerate() {
-            let want: f32 = x.iter().zip(&w[j * k..(j + 1) * k]).map(|(a, b)| a * b).sum();
+            let want: f32 = x
+                .iter()
+                .zip(&w[j * k..(j + 1) * k])
+                .map(|(a, b)| a * b)
+                .sum();
             assert!(
                 (g - want).abs() < 0.01 * want.abs().max(1.0),
                 "dot[{j}] {g} vs {want}"
@@ -270,8 +269,15 @@ mod tests {
         let mut got = vec![0.0; 4];
         matmul_q8q4(&mut got, &xq, &q4, 1, k, 4);
         for (j, g) in got.iter().enumerate() {
-            let want: f32 = x.iter().zip(&w[j * k..(j + 1) * k]).map(|(a, b)| a * b).sum();
-            assert!((g - want).abs() < 0.15 * want.abs().max(1.0), "{g} vs {want}");
+            let want: f32 = x
+                .iter()
+                .zip(&w[j * k..(j + 1) * k])
+                .map(|(a, b)| a * b)
+                .sum();
+            assert!(
+                (g - want).abs() < 0.15 * want.abs().max(1.0),
+                "{g} vs {want}"
+            );
         }
     }
 }

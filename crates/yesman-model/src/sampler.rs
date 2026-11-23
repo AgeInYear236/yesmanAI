@@ -54,7 +54,11 @@ impl Sampler {
 
         let n = logits.len();
         let mut order: Vec<usize> = (0..n).collect();
-        let desc = |a: &usize, b: &usize| logits[*b].partial_cmp(&logits[*a]).unwrap();
+        let desc = |a: &usize, b: &usize| {
+            logits[*b]
+                .partial_cmp(&logits[*a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        };
 
         if self.top_k > 0 && self.top_k < n {
             order.select_nth_unstable_by(self.top_k - 1, desc);
@@ -93,9 +97,12 @@ impl Sampler {
 }
 
 fn argmax(x: &[f32]) -> u32 {
-    let (idx, _) = x.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, v)| {
-        if *v > bv { (i, *v) } else { (bi, bv) }
-    });
+    let (idx, _) = x
+        .iter()
+        .enumerate()
+        .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, v)| {
+            if *v > bv { (i, *v) } else { (bi, bv) }
+        });
     idx as u32
 }
 

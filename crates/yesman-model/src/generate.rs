@@ -11,7 +11,11 @@ pub struct GenerateOptions {
 
 impl Default for GenerateOptions {
     fn default() -> Self {
-        Self { max_new_tokens: 512, stop_ids: Vec::new(), max_ctx: 4096 }
+        Self {
+            max_new_tokens: 512,
+            stop_ids: Vec::new(),
+            max_ctx: 4096,
+        }
     }
 }
 
@@ -72,10 +76,20 @@ pub fn chat_once(
     let prompt = chat::render(messages);
     let ids = tok.encode(&prompt)?;
     let mut stop = cfg.eos_ids();
-    if let Some(id) = tok.id_of(chat::IM_END) {
+    if let Some(id) = tok.id_of(chat::IM_END)
+        && !stop.contains(&id)
+    {
         stop.push(id);
     }
-    let opts = GenerateOptions { stop_ids: stop, ..opts.clone() };
+    if let Some(id) = tok.id_of("<|endoftext|>")
+        && !stop.contains(&id)
+    {
+        stop.push(id);
+    }
+    let opts = GenerateOptions {
+        stop_ids: stop,
+        ..opts.clone()
+    };
     let (_, text) = generate(model, tok, &ids, &opts, sampler, on_token)?;
     Ok(text)
 }

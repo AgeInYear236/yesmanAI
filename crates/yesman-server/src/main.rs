@@ -7,7 +7,10 @@
 use std::{
     convert::Infallible,
     path::PathBuf,
-    sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -111,13 +114,19 @@ impl Message {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 fn build_messages(msgs: &[Message]) -> Vec<chat::Message> {
     let mut out: Vec<chat::Message> = msgs
         .iter()
-        .map(|m| chat::Message { role: m.role.clone(), content: m.text() })
+        .map(|m| chat::Message {
+            role: m.role.clone(),
+            content: m.text(),
+        })
         .collect();
     if !out.iter().any(|m| m.role == "system") {
         out.insert(0, chat::system(chat::DEFAULT_SYSTEM));
@@ -147,13 +156,19 @@ impl AppState {
         }
         let max_ctx = self.0.ctx;
         let opts = GenerateOptions {
-            max_new_tokens: req.max_tokens.unwrap_or(512).min(max_ctx.saturating_sub(prompt_ids.len())),
+            max_new_tokens: req
+                .max_tokens
+                .unwrap_or(512)
+                .min(max_ctx.saturating_sub(prompt_ids.len())),
             stop_ids: stop,
             max_ctx,
         };
 
         let mut s = Sampler::new(req.seed.unwrap_or_else(rand_u64));
-        s.temperature = req.temperature.or(self.0.generation.temperature).unwrap_or(0.7);
+        s.temperature = req
+            .temperature
+            .or(self.0.generation.temperature)
+            .unwrap_or(0.7);
         s.top_p = req.top_p.or(self.0.generation.top_p).unwrap_or(0.8);
         s.top_k = req.top_k.or(self.0.generation.top_k).unwrap_or(20);
         s.repetition_penalty = req
@@ -195,7 +210,11 @@ async fn main() -> Result<()> {
     eprintln!(
         "loaded {} layers, {} weights in {:.2}s",
         cfg.num_hidden_layers,
-        if args.cache.is_some() { "cached" } else { dtype.name() },
+        if args.cache.is_some() {
+            "cached"
+        } else {
+            dtype.name()
+        },
         t0.elapsed().as_secs_f32()
     );
 
@@ -262,13 +281,25 @@ async fn chat_completions(
 }
 
 async fn non_stream_response(state: AppState, plan: RequestPlan) -> impl IntoResponse {
-    let RequestPlan { prompt_ids, opts, sampler, id, model_id } = plan;
+    let RequestPlan {
+        prompt_ids,
+        opts,
+        sampler,
+        id,
+        model_id,
+    } = plan;
     let prompt_len = prompt_ids.len();
     let result = tokio::task::spawn_blocking(move || {
         let mut model = state.0.model.lock().unwrap();
         let mut sampler = sampler;
-        let res: Result<(Vec<u32>, String)> =
-            generate(&mut *model, &state.0.tok, &prompt_ids, &opts, &mut sampler, |_| Ok(()));
+        let res: Result<(Vec<u32>, String)> = generate(
+            &mut model,
+            &state.0.tok,
+            &prompt_ids,
+            &opts,
+            &mut sampler,
+            |_| Ok(()),
+        );
         res.map(|(ids, text)| (ids.len(), text))
     })
     .await;
@@ -307,7 +338,7 @@ async fn stream_response(state: AppState, plan: RequestPlan) -> impl IntoRespons
         let mut model = worker_state.0.model.lock().unwrap();
         let mut sampler = plan.sampler;
         let res: Result<(Vec<u32>, String)> = generate(
-            &mut *model,
+            &mut model,
             &worker_state.0.tok,
             &plan.prompt_ids,
             &plan.opts,

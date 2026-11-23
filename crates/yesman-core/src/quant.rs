@@ -29,10 +29,7 @@ impl Q8Tensor {
     pub fn from_f32(data: &[f32], rows: usize, cols: usize) -> Self {
         assert_eq!(data.len(), rows * cols);
         assert_eq!(cols % BLOCK, 0, "cols must be a multiple of {BLOCK}");
-        let blocks = data
-            .par_chunks(cols)
-            .flat_map(|row| quantize_row(row))
-            .collect();
+        let blocks = data.par_chunks(cols).flat_map(quantize_row).collect();
         Self { blocks, rows, cols }
     }
 
@@ -42,9 +39,13 @@ impl Q8Tensor {
         let blocks = t
             .data
             .par_chunks(t.cols)
-            .flat_map(|row| quantize_row_bf16(row))
+            .flat_map(quantize_row_bf16)
             .collect();
-        Self { blocks, rows: t.rows, cols: t.cols }
+        Self {
+            blocks,
+            rows: t.rows,
+            cols: t.cols,
+        }
     }
 
     /// Construct from the raw bytes of a `Vec<BlockQ8>` (cache file).
@@ -77,13 +78,9 @@ impl Q8Tensor {
     pub fn as_bytes(&self) -> &[u8] {
         let size = std::mem::size_of::<BlockQ8>();
         unsafe {
-            std::slice::from_raw_parts(
-                self.blocks.as_ptr() as *const u8,
-                self.blocks.len() * size,
-            )
+            std::slice::from_raw_parts(self.blocks.as_ptr() as *const u8, self.blocks.len() * size)
         }
     }
-
 
     pub fn blocks_per_row(&self) -> usize {
         self.cols / BLOCK
@@ -146,9 +143,9 @@ fn quantize_row_bf16(x: &[half::bf16]) -> Vec<BlockQ8> {
 pub fn quantize_rows(x: &[f32], k: usize) -> Vec<BlockQ8> {
     let m = x.len() / k;
     if m <= 2 {
-        x.chunks(k).flat_map(|row| quantize_row(row)).collect()
+        x.chunks(k).flat_map(quantize_row).collect()
     } else {
-        x.par_chunks(k).flat_map(|row| quantize_row(row)).collect()
+        x.par_chunks(k).flat_map(quantize_row).collect()
     }
 }
 
@@ -254,7 +251,10 @@ mod tests {
                 err = err.max((got - v).abs() / amax.max(1e-6));
             }
         }
-        assert!(err < 1.0 / 127.0 + 1e-3, "error larger than one quant step: {err}");
+        assert!(
+            err < 1.0 / 127.0 + 1e-3,
+            "error larger than one quant step: {err}"
+        );
     }
 
     #[test]
@@ -267,9 +267,15 @@ mod tests {
         let mut got = vec![0.0; 4];
         matmul_q8(&mut got, &xq, &qt, 1, k, 4);
         for (j, g) in got.iter().enumerate() {
-            let want: f32 = x.iter().zip(&w[j * k..(j + 1) * k]).map(|(a, b)| a * b).sum();
-            assert!((g - want).abs() < 0.05 * want.abs().max(1.0), "{g} vs {want}");
+            let want: f32 = x
+                .iter()
+                .zip(&w[j * k..(j + 1) * k])
+                .map(|(a, b)| a * b)
+                .sum();
+            assert!(
+                (g - want).abs() < 0.05 * want.abs().max(1.0),
+                "{g} vs {want}"
+            );
         }
     }
 }
-

@@ -105,7 +105,12 @@ impl BlockQ4K {
             set8(&mut packed, j, sc);
             set8(&mut packed, NSUB + j, m);
         }
-        BlockQ4K { d, dmin, scales: packed, qs }
+        BlockQ4K {
+            d,
+            dmin,
+            scales: packed,
+            qs,
+        }
     }
 
     /// `(sc_d, min_d)` pairs for the 8 sub-blocks.
@@ -114,10 +119,10 @@ impl BlockQ4K {
         let d = self.d;
         let dmin = self.dmin;
         let mut out = [(0.0f32, 0.0f32); NSUB];
-        for j in 0..NSUB {
+        for (j, item) in out.iter_mut().enumerate() {
             let sc = get8(&self.scales, j) as f32;
             let m = get8(&self.scales, NSUB + j) as f32 - 127.0;
-            out[j] = (d * sc, dmin * m);
+            *item = (d * sc, dmin * m);
         }
         out
     }
@@ -148,7 +153,7 @@ impl Q4KTensor {
             .par_chunks(cols)
             .flat_map(|row| {
                 row.chunks(SUPER)
-                    .map(|c| BlockQ4K::quantize(c))
+                    .map(BlockQ4K::quantize)
                     .collect::<Vec<_>>()
             })
             .collect();
@@ -162,12 +167,14 @@ impl Q4KTensor {
             .par_chunks(t.cols)
             .flat_map(|row| {
                 let f: Vec<f32> = row.iter().map(|v| v.to_f32()).collect();
-                f.chunks(SUPER)
-                    .map(|c| BlockQ4K::quantize(c))
-                    .collect::<Vec<_>>()
+                f.chunks(SUPER).map(BlockQ4K::quantize).collect::<Vec<_>>()
             })
             .collect();
-        Self { blocks, rows: t.rows, cols: t.cols }
+        Self {
+            blocks,
+            rows: t.rows,
+            cols: t.cols,
+        }
     }
 
     /// Reconstruct from the raw bytes of a `Vec<BlockQ4K>` (cache file).
@@ -196,10 +203,7 @@ impl Q4KTensor {
     pub fn as_bytes(&self) -> &[u8] {
         let size = std::mem::size_of::<BlockQ4K>();
         unsafe {
-            std::slice::from_raw_parts(
-                self.blocks.as_ptr() as *const u8,
-                self.blocks.len() * size,
-            )
+            std::slice::from_raw_parts(self.blocks.as_ptr() as *const u8, self.blocks.len() * size)
         }
     }
 
@@ -217,9 +221,8 @@ impl Q4KTensor {
         let mut nib = [0i8; SUB];
         for b in self.row(r) {
             let f = b.factors();
-            for j in 0..NSUB {
+            for (j, &(sd, md)) in f.iter().enumerate() {
                 b.nibbles(j, &mut nib);
-                let (sd, md) = f[j];
                 for &q in nib.iter() {
                     out.push(sd * q as f32 - md);
                 }
@@ -254,9 +257,9 @@ fn dot_row_scalar_impl(a: &[BlockQ8], b: &[BlockQ4K]) -> f32 {
             let (sd, md) = f[j];
             let mut sq = 0i32;
             let mut sa = 0i32;
-            for i in 0..SUB {
-                sq += ba.q[i] as i32 * nib[i] as i32;
-                sa += ba.q[i] as i32;
+            for (bai, &nibi) in ba.q.iter().zip(&nib) {
+                sq += *bai as i32 * nibi as i32;
+                sa += *bai as i32;
             }
             total += ba.d * (sd * sq as f32 - md * sa as f32);
         }
@@ -277,9 +280,7 @@ unsafe fn dot_row_avx2(a: &[BlockQ8], b: &[BlockQ4K]) -> f32 {
             let (sd, md) = f[j];
             let (sq, sa) = unsafe {
                 let va = _mm256_loadu_si256(ba.q.as_ptr() as *const __m256i);
-                let raw = _mm_loadu_si128(
-                    bb.qs[j * (SUB / 2)..].as_ptr() as *const __m128i
-                );
+                let raw = _mm_loadu_si128(bb.qs[j * (SUB / 2)..].as_ptr() as *const __m128i);
                 let mask = _mm_set1_epi8(0x0f);
                 let lo = _mm_and_si128(raw, mask);
                 let hi = _mm_and_si128(_mm_srli_epi16(raw, 4), mask);
@@ -290,14 +291,8 @@ unsafe fn dot_row_avx2(a: &[BlockQ8], b: &[BlockQ4K]) -> f32 {
                 let n0 = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(nib));
                 let n1 = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(nib, 1));
 
-                let p = _mm256_add_epi32(
-                    _mm256_madd_epi16(a0, n0),
-                    _mm256_madd_epi16(a1, n1),
-                );
-                let s = _mm256_add_epi32(
-                    _mm256_madd_epi16(a0, ones),
-                    _mm256_madd_epi16(a1, ones),
-                );
+                let p = _mm256_add_epi32(_mm256_madd_epi16(a0, n0), _mm256_madd_epi16(a1, n1));
+                let s = _mm256_add_epi32(_mm256_madd_epi16(a0, ones), _mm256_madd_epi16(a1, ones));
                 let hp = _mm256_hadd_epi32(p, p);
                 let hp = _mm256_hadd_epi32(hp, hp);
                 let hs = _mm256_hadd_epi32(s, s);
@@ -319,14 +314,7 @@ unsafe fn dot_row_avx2(a: &[BlockQ8], b: &[BlockQ4K]) -> f32 {
 /// `k` must be a multiple of 256 (true for all Qwen2.5-1.5B matrices:
 /// 1536, 8960 and 256 all are). Output columns are split across rayon
 /// workers for single-token decode.
-pub fn matmul_q8q4k(
-    out: &mut [f32],
-    xq: &[BlockQ8],
-    w: &Q4KTensor,
-    m: usize,
-    k: usize,
-    n: usize,
-) {
+pub fn matmul_q8q4k(out: &mut [f32], xq: &[BlockQ8], w: &Q4KTensor, m: usize, k: usize, n: usize) {
     assert_eq!(w.cols, k);
     assert_eq!(k % SUPER, 0);
     assert!(out.len() >= m * n);
@@ -396,7 +384,11 @@ mod tests {
         let mut got = vec![0.0; 4];
         matmul_q8q4k(&mut got, &xq, &q, 1, k, 4);
         for (j, g) in got.iter().enumerate() {
-            let want: f32 = x.iter().zip(&w[j * k..(j + 1) * k]).map(|(a, b)| a * b).sum();
+            let want: f32 = x
+                .iter()
+                .zip(&w[j * k..(j + 1) * k])
+                .map(|(a, b)| a * b)
+                .sum();
             assert!(
                 (g - want).abs() < 0.01 * want.abs().max(1.0),
                 "dot[{j}] {g} vs {want}"
@@ -426,11 +418,19 @@ mod tests {
         let mut err_k = 0.0f32;
         let mut err_0 = 0.0f32;
         for j in 0..16 {
-            let want: f32 = x.iter().zip(&w[j * k..(j + 1) * k]).map(|(a, b)| a * b).sum();
+            let want: f32 = x
+                .iter()
+                .zip(&w[j * k..(j + 1) * k])
+                .map(|(a, b)| a * b)
+                .sum();
             err_k += (a[j] - want).powi(2);
             err_0 += (b[j] - want).powi(2);
         }
-        println!("Q4_K dot RMSE {:.6}, Q4_0 dot RMSE {:.6}", (err_k / 16.0).sqrt(), (err_0 / 16.0).sqrt());
+        println!(
+            "Q4_K dot RMSE {:.6}, Q4_0 dot RMSE {:.6}",
+            (err_k / 16.0).sqrt(),
+            (err_0 / 16.0).sqrt()
+        );
         assert!(
             err_k < err_0 * 1.10,
             "Q4_K dot must be at least as accurate as Q4_0 on Gaussian weights"

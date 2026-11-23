@@ -125,7 +125,11 @@ mod tests {
         let mut got = vec![0.0; 3];
         matmul(&mut got, &x, &bw, 1, k, 3);
         for (j, g) in got.iter().enumerate() {
-            let terms: Vec<f32> = x.iter().zip(&w[j * k..(j + 1) * k]).map(|(a, b)| a * b).collect();
+            let terms: Vec<f32> = x
+                .iter()
+                .zip(&w[j * k..(j + 1) * k])
+                .map(|(a, b)| a * b)
+                .collect();
             let want: f32 = terms.iter().sum();
             // bf16 rounds each weight to ~2^-9; with cancellation the absolute
             // error is bounded by the sum of magnitudes, not by |want|.

@@ -9,15 +9,24 @@ pub struct Message {
 }
 
 pub fn system(content: impl Into<String>) -> Message {
-    Message { role: "system".into(), content: content.into() }
+    Message {
+        role: "system".into(),
+        content: content.into(),
+    }
 }
 
 pub fn user(content: impl Into<String>) -> Message {
-    Message { role: "user".into(), content: content.into() }
+    Message {
+        role: "user".into(),
+        content: content.into(),
+    }
 }
 
 pub fn assistant(content: impl Into<String>) -> Message {
-    Message { role: "assistant".into(), content: content.into() }
+    Message {
+        role: "assistant".into(),
+        content: content.into(),
+    }
 }
 
 pub const DEFAULT_SYSTEM: &str =

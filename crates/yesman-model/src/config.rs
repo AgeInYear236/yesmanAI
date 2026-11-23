@@ -45,7 +45,9 @@ impl Config {
 
     pub fn eos_ids(&self) -> Vec<u32> {
         match &self.eos_token_id {
-            Some(serde_json::Value::Number(n)) => n.as_u64().map(|v| vec![v as u32]).unwrap_or_default(),
+            Some(serde_json::Value::Number(n)) => {
+                n.as_u64().map(|v| vec![v as u32]).unwrap_or_default()
+            }
             Some(serde_json::Value::Array(a)) => a
                 .iter()
                 .filter_map(|v| v.as_u64().map(|v| v as u32))
@@ -68,6 +70,8 @@ pub struct GenerationConfig {
     pub repetition_penalty: Option<f32>,
     #[serde(default)]
     pub do_sample: Option<bool>,
+    #[serde(default)]
+    pub eos_token_id: Option<serde_json::Value>,
 }
 
 impl GenerationConfig {
@@ -77,5 +81,18 @@ impl GenerationConfig {
             return Ok(Self::default());
         }
         Ok(serde_json::from_str(&std::fs::read_to_string(p)?)?)
+    }
+
+    pub fn eos_ids(&self) -> Vec<u32> {
+        match &self.eos_token_id {
+            Some(serde_json::Value::Number(n)) => {
+                n.as_u64().map(|v| vec![v as u32]).unwrap_or_default()
+            }
+            Some(serde_json::Value::Array(a)) => a
+                .iter()
+                .filter_map(|v| v.as_u64().map(|v| v as u32))
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 }

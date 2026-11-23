@@ -12,7 +12,7 @@ use rayon::prelude::*;
 /// scheduling, while keeping enough slack for work stealing.
 pub fn out_chunk(n: usize) -> usize {
     let workers = rayon::current_num_threads().max(1);
-    ((n + 2 * workers - 1) / (2 * workers)).max(64).min(n.max(1))
+    n.div_ceil(2 * workers).max(64).min(n.max(1))
 }
 
 #[inline]
@@ -98,9 +98,7 @@ pub fn matmul(out: &mut [f32], x: &[f32], w: &[f32], m: usize, k: usize, n: usiz
         let c = out_chunk(n);
         out.par_chunks_mut(c).enumerate().for_each(|(ci, o)| {
             let j0 = ci * c;
-            for j in 0..o.len() {
-                o[j] = 0.0;
-            }
+            o.fill(0.0);
             for i in 0..m {
                 let xrow = &x[i * k..(i + 1) * k];
                 for (j, o) in o.iter_mut().enumerate() {
@@ -118,7 +116,15 @@ fn matmul_rows(o: &mut [f32], xrow: &[f32], w: &[f32], k: usize) {
 }
 
 /// Same as [`matmul`] with a per-column bias added (Qwen2 has q/k/v biases).
-pub fn matmul_bias(out: &mut [f32], x: &[f32], w: &[f32], bias: &[f32], m: usize, k: usize, n: usize) {
+pub fn matmul_bias(
+    out: &mut [f32],
+    x: &[f32],
+    w: &[f32],
+    bias: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) {
     matmul(out, x, w, m, k, n);
     for row in out[..m * n].chunks_mut(n) {
         for (v, b) in row.iter_mut().zip(bias) {
@@ -146,7 +152,9 @@ pub fn rmsnorm(out: &mut [f32], x: &[f32], weight: &[f32], eps: f32) {
             row(o, xi);
         }
     } else {
-        out.par_chunks_mut(d).zip(x.par_chunks(d)).for_each(|(o, xi)| row(o, xi));
+        out.par_chunks_mut(d)
+            .zip(x.par_chunks(d))
+            .for_each(|(o, xi)| row(o, xi));
     }
 }
 
@@ -156,7 +164,9 @@ pub fn add_into(a: &mut [f32], b: &[f32]) {
             *a += b;
         }
     } else {
-        a.par_iter_mut().zip(b.par_iter()).for_each(|(a, b)| *a += b);
+        a.par_iter_mut()
+            .zip(b.par_iter())
+            .for_each(|(a, b)| *a += b);
     }
 }
 

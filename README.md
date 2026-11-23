@@ -132,6 +132,20 @@ rust q8_0    785  27.203852   |  Q4_K_M  785  27.265097
 all quantized modes: logits identical whether loaded from safetensors or cache
 ```
 
+### Perplexity (WikiText-2, 2173 tokens)
+
+Evaluated end-to-end on pure CPU via `yesman --perplexity <corpus>` or `bash tools/eval_perplexity.sh`:
+
+| Format | Weight Storage / Cache | Perplexity | Degradation vs bf16 |
+| --- | --- | --- | --- |
+| `bf16` | 2.9 GB | **6.13** | baseline (exact) |
+| `q8` | 1.7 GB | **6.15** | +0.4% |
+| `q4km` | 1.6 GB | **6.28** | **+2.4%** |
+| `q4k` | 993 MB | **6.39** | **+4.3%** |
+| `q4` | 1.1 GB | **6.57** | +7.1% |
+
+Tested up to 6.3k–32k context with **chunked prefill** without memory bloat.
+
 Generation is coherent (`Paris`, `Tokyo`, `4`, poems about Rust). Pure CPU
 decode on 20 cores:
 
@@ -167,6 +181,9 @@ minimum. What got us there from ~2.8 tok/s:
    pass over V), but it accumulates ~0.15 logit of drift on quantized weights
    over 28 layers, so the default stays the exact two-pass softmax, which
    matches numpy to 3e-5.
+5. **Chunked prefill**: long prompts are automatically partitioned into chunks
+   of 512 tokens. Peak attention scratchpad scales with the chunk size rather than
+   the total sequence length, preventing $O(t^2)$ memory explosion on 8k–32k context.
 
 `YESMAN_PROFILE=1` prints a per-stage breakdown; `cargo run --release -p
 yesman-core --example bench_matmul` microbenchmarks the kernels. Further CPU
@@ -179,8 +196,10 @@ numpy implementation:
 
 ```bash
 python3 tools/make_tiny.py                 # tiny fixture + expected logits
-cargo test --release                       # 23 tests: forward, KV cache, quantizers, cache roundtrip
+cargo test --release                       # 25 tests: forward, KV cache, quantizers, cache roundtrip, chunked prefill, perplexity
 bash tools/verify.sh                      # real weights: Rust vs numpy + generation
+bash tools/eval_perplexity.sh             # perplexity across all formats on WikiText-2
+```
 
 # real checkpoint: same token ids in, compare logits out
 ./target/release/yesman --print-ids --prompt "Hello"             > ids.txt

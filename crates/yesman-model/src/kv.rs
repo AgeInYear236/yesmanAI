@@ -24,12 +24,24 @@ impl KvCache {
         self.len
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn max(&self) -> usize {
+        self.max
+    }
+
     pub fn clear(&mut self) {
         self.len = 0;
     }
 
     pub fn write(&mut self, layer: usize, pos: usize, krow: &[f32], vrow: &[f32]) {
-        assert!(pos < self.max, "kv cache overflow: pos {pos} >= {}", self.max);
+        assert!(
+            pos < self.max,
+            "kv cache overflow: pos {pos} >= {}",
+            self.max
+        );
         let off = pos * self.kv_dim;
         self.k[layer][off..off + self.kv_dim].copy_from_slice(krow);
         self.v[layer][off..off + self.kv_dim].copy_from_slice(vrow);

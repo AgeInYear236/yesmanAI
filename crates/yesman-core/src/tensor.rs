@@ -12,14 +12,20 @@ impl Tensor {
     pub fn new(data: Vec<f32>, shape: Vec<usize>) -> Result<Self> {
         let n: usize = shape.iter().product();
         if n != data.len() {
-            return Err(anyhow!("shape {shape:?} needs {n} elements, got {}", data.len()));
+            return Err(anyhow!(
+                "shape {shape:?} needs {n} elements, got {}",
+                data.len()
+            ));
         }
         Ok(Self { data, shape })
     }
 
     pub fn zeros(shape: Vec<usize>) -> Self {
         let n: usize = shape.iter().product();
-        Self { data: vec![0.0; n], shape }
+        Self {
+            data: vec![0.0; n],
+            shape,
+        }
     }
 
     pub fn numel(&self) -> usize {
