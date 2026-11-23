@@ -58,7 +58,7 @@ struct Args {
     #[arg(long)]
     print_ids: bool,
 
-    /// Weight storage: f32, bf16 (default, exact), q8 (Q8_0), q4 (Q4_0)
+    /// Weights: f32 | bf16 (default) | q8 | q4 | q4k (all-4bit) | q4km (FFN@Q8)
     #[arg(long, default_value = "bf16")]
     dtype: String,
 

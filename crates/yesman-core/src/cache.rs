@@ -13,16 +13,17 @@ use anyhow::{Result, anyhow, bail};
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 
-use crate::{Q4Tensor, Q8Tensor};
+use crate::{Q4KTensor, Q4Tensor, Q8Tensor};
 
 const MAGIC: &[u8; 8] = b"YESMANQ1";
 const HEADER_LEN: usize = 64;
 const ALIGN: usize = 64;
 
-/// 0 = f32 array, 1 = Q8_0 blocks, 2 = Q4_0 blocks.
+/// 0 = f32 array, 1 = Q8_0 blocks, 2 = Q4_0 blocks, 3 = Q4_K blocks.
 pub const KIND_F32: u8 = 0;
 pub const KIND_Q8: u8 = 1;
 pub const KIND_Q4: u8 = 2;
+pub const KIND_Q4K: u8 = 3;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Entry {
@@ -36,7 +37,16 @@ pub struct Entry {
 #[derive(Serialize, Deserialize)]
 struct Header {
     entries: HashMap<String, Entry>,
+    /// Bumped when a quantized block layout changes. Old caches that contain
+    /// only Q8_0/Q4_0 entries (layout 0) stay valid.
+    #[serde(default)]
+    layout: u8,
 }
+
+/// Current block layout epoch. 2 = Q4_K with 8-bit scale/min and f32
+/// super-scales (152-byte block); 1 = the earlier 148-byte Q4_K layout.
+const LAYOUT: u8 = 2;
+const Q4K_MIN_LAYOUT: u8 = 2;
 
 pub struct CacheEntry<'a> {
     pub name: &'a str,
@@ -47,7 +57,7 @@ pub struct CacheEntry<'a> {
 }
 
 pub fn write_cache(path: &Path, entries: &[CacheEntry<'_>]) -> Result<()> {
-    let mut toc = Header { entries: HashMap::new() };
+    let mut toc = Header { entries: HashMap::new(), layout: LAYOUT };
     let mut offset = 0u64;
     for e in entries {
         toc.entries.insert(
@@ -89,6 +99,7 @@ pub fn write_cache(path: &Path, entries: &[CacheEntry<'_>]) -> Result<()> {
 pub struct QuantCache {
     mmap: Mmap,
     toc: HashMap<String, Entry>,
+    layout: u8,
     /// Byte offset in the file where the payload starts.
     base: usize,
 }
@@ -106,7 +117,7 @@ impl QuantCache {
         let toc_len = u64::from_le_bytes(mmap[16..24].try_into()?) as usize;
         let base = u64::from_le_bytes(mmap[24..32].try_into()?) as usize;
         let toc: Header = serde_json::from_slice(&mmap[HEADER_LEN..HEADER_LEN + toc_len])?;
-        Ok(Self { mmap, toc: toc.entries, base })
+        Ok(Self { mmap, toc: toc.entries, layout: toc.layout, base })
     }
 
     pub fn has(&self, name: &str) -> bool {
@@ -156,5 +167,19 @@ impl QuantCache {
             bail!("tensor `{name}` is not Q4_0");
         }
         Ok(Q4Tensor::from_bytes(e.rows, e.cols, self.raw(name)?))
+    }
+
+    pub fn q4k(&self, name: &str) -> Result<Q4KTensor> {
+        let e = self.entry(name)?;
+        if e.kind != KIND_Q4K {
+            bail!("tensor `{name}` is not Q4_K");
+        }
+        if self.layout < Q4K_MIN_LAYOUT {
+            bail!(
+                "this Q4_K cache uses an older block layout (v{}); rebuild it with --save-cache",
+                self.layout
+            );
+        }
+        Ok(Q4KTensor::from_bytes(e.rows, e.cols, self.raw(name)?))
     }
 }

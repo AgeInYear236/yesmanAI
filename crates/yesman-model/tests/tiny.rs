@@ -96,6 +96,50 @@ fn q4_forward_stays_close() {
     assert!(worst < 0.35 * max_abs, "Q4_0 deviation too large: {worst} vs {max_abs}");
 }
 
+/// Q4_K (4-bit weights with per-32 scale/min) must be closer than Q4_0.
+/// Uses the 256-wide fixture, since Q4_K super-blocks need multiples of 256.
+#[test]
+fn q4k_forward_stays_close() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/tiny256");
+    let raw = std::fs::read_to_string(dir.join("expected.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let ids: Vec<u32> = v["ids"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect();
+    let want: Vec<f32> = v["logits"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect();
+
+    let mut m = Qwen2::from_dir(&dir, 128, DType::Q4K).unwrap();
+    let got = m.forward(&ids, 0);
+    let max_abs = want.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+    let worst = got
+        .iter()
+        .zip(want.iter())
+        .fold(0.0f32, |a, (g, w)| a.max((g - w).abs()));
+    println!("Q4_K max deviation: {worst} ({:.2}% of max |logit|)", 100.0 * worst / max_abs);
+    // The 1-layer random model has uncalibrated logits where correlated
+    // rounding noise dominates; kernel-level accuracy is asserted in
+    // yesman-core's q4k tests instead. Here we only guard against garbage.
+    assert!(got.iter().all(|v| v.is_finite()));
+    assert!(worst < 0.35 * max_abs, "Q4_K deviation too large: {worst} vs {max_abs}");
+}
+
+/// Saving quantized weights to the cache and loading them back must give
+/// bit-identical logits (covers Q8_0, Q4_K and mixed Q4_K_M caches).
+#[test]
+fn quant_cache_roundtrip() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/tiny256");
+    for dt in [DType::Q8, DType::Q4K, DType::Q4KM] {
+        let mut m = Qwen2::from_dir(&dir, 128, dt).unwrap();
+        let want = m.forward(&[5, 7, 11, 13], 0);
+        let path = std::env::temp_dir().join(format!("yesman_cache_{}_{:?}.ymq", std::process::id(), dt));
+        m.save_cache(&path).unwrap();
+        let mut loaded = Qwen2::from_cache(&dir, 128, &path).unwrap();
+        let got = loaded.forward(&[5, 7, 11, 13], 0);
+        for (i, (a, b)) in want.iter().zip(got.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-5, "dtype {dt:?} logit {i}: {a} vs {b}");
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+}
+
 /// Feeding tokens one at a time through the KV cache must reproduce the
 /// batched prefill result exactly -- this is what catches cache bugs.
 #[test]

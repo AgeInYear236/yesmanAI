@@ -32,6 +32,7 @@ use yesman_model::{
 struct Args {
     #[arg(short, long, default_value = "models/Qwen2.5-1.5B-Instruct")]
     model: PathBuf,
+    /// f32 | bf16 | q8 | q4 | q4k (all 4-bit) | q4km (FFN in Q8, best quality)
     #[arg(long, default_value = "bf16")]
     dtype: String,
     #[arg(long, default_value_t = 4096)]

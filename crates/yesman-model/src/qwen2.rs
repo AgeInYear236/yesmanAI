@@ -9,7 +9,8 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow};
 use rayon::prelude::*;
 use yesman_core::{
-    Bf16Tensor, Q4Tensor, Q8Tensor, SafeFile, Tensor, bf16, cache, ops, q4, quant,
+    Bf16Tensor, Q4KTensor, Q4Tensor, Q8Tensor, SafeFile, Tensor, bf16, cache, ops, q4, q4k,
+    quant,
 };
 
 use crate::{config::Config, kv::KvCache};
@@ -26,6 +27,10 @@ pub enum DType {
     Q8,
     /// Q4_0 block quantization: ~0.94 GB, fastest on CPU.
     Q4,
+    /// Q4_K super-block quantization: ~0.85 GB (Q4_K_S-like, all 4-bit).
+    Q4K,
+    /// Q4_K_M-like: Q4_K attention + Q8_0 FFN (quality close to Q8_0).
+    Q4KM,
 }
 
 impl DType {
@@ -35,7 +40,9 @@ impl DType {
             "bf16" | "bfloat16" => DType::Bf16,
             "q8" | "q8_0" | "int8" => DType::Q8,
             "q4" | "q4_0" => DType::Q4,
-            other => return Err(anyhow!("unknown dtype `{other}` (f32|bf16|q8|q4)")),
+            "q4k" | "q4_k" | "q4ks" | "q4_k_s" => DType::Q4K,
+            "q4km" | "q4_k_m" => DType::Q4KM,
+            other => return Err(anyhow!("unknown dtype `{other}` (f32|bf16|q8|q4|q4k|q4km)")),
         })
     }
 
@@ -45,6 +52,8 @@ impl DType {
             DType::Bf16 => "bf16",
             DType::Q8 => "Q8_0",
             DType::Q4 => "Q4_0",
+            DType::Q4K => "Q4_K",
+            DType::Q4KM => "Q4_K_M",
         }
     }
 }
@@ -55,6 +64,7 @@ enum Weight {
     BF16(Bf16Tensor),
     Q8(Q8Tensor),
     Q4(Q4Tensor),
+    Q4K(Q4KTensor),
 }
 
 impl Weight {
@@ -64,6 +74,9 @@ impl Weight {
             DType::Bf16 => Weight::BF16(file.get_bf16(name)?),
             DType::Q8 => Weight::Q8(Q8Tensor::from_bf16(&file.get_bf16(name)?)),
             DType::Q4 => Weight::Q4(Q4Tensor::from_bf16(&file.get_bf16(name)?)),
+            DType::Q4K | DType::Q4KM => {
+                Weight::Q4K(Q4KTensor::from_bf16(&file.get_bf16(name)?))
+            }
         })
     }
 
@@ -80,6 +93,10 @@ impl Weight {
                 let xq = quant::quantize_rows(x, k);
                 q4::matmul_q8q4(out, &xq, q, m, k, n);
             }
+            Weight::Q4K(q) => {
+                let xq = quant::quantize_rows(x, k);
+                q4k::matmul_q8q4k(out, &xq, q, m, k, n);
+            }
         }
     }
 
@@ -89,6 +106,7 @@ impl Weight {
             Weight::BF16(t) => t.dequant_row(row),
             Weight::Q8(t) => t.dequantize_row(row),
             Weight::Q4(t) => t.dequantize_row(row),
+            Weight::Q4K(t) => t.dequantize_row(row),
         }
     }
 
@@ -96,6 +114,7 @@ impl Weight {
         Ok(match c.entry(name)?.kind {
             cache::KIND_Q8 => Weight::Q8(c.q8(name)?),
             cache::KIND_Q4 => Weight::Q4(c.q4(name)?),
+            cache::KIND_Q4K => Weight::Q4K(c.q4k(name)?),
             cache::KIND_F32 => {
                 let e = c.entry(name)?;
                 let data = c.f32_vec(name)?;
@@ -110,6 +129,7 @@ impl Weight {
         match self {
             Weight::Q8(t) => Some((cache::KIND_Q8, t.rows, t.cols, t.as_bytes())),
             Weight::Q4(t) => Some((cache::KIND_Q4, t.rows, t.cols, t.as_bytes())),
+            Weight::Q4K(t) => Some((cache::KIND_Q4K, t.rows, t.cols, t.as_bytes())),
             _ => None,
         }
     }
@@ -170,11 +190,18 @@ impl Qwen2 {
         // error (llama.cpp keeps the output tensor in a higher-precision format
         // too). Keep it at Q8 unless the caller explicitly asked for Q4.
         let embed_dt = match dt {
-            DType::Q4 => DType::Q8,
+            DType::Q4 | DType::Q4K | DType::Q4KM => DType::Q8,
             other => other,
         };
         let embed = Weight::load(&file, "model.embed_tokens.weight", embed_dt)?;
         let final_norm = file.get("model.norm.weight")?.data;
+
+        // Q4_K_M keeps the large feed-forward matrices at 8 bits: they are
+        // ~77% of the weights and dominate the quantization error.
+        let mlp_dt = match dt {
+            DType::Q4KM => DType::Q8,
+            other => other,
+        };
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
@@ -189,9 +216,9 @@ impl Qwen2 {
                 bq: file.get(&format!("{p}.self_attn.q_proj.bias"))?.data,
                 bk: file.get(&format!("{p}.self_attn.k_proj.bias"))?.data,
                 bv: file.get(&format!("{p}.self_attn.v_proj.bias"))?.data,
-                w_gate: Weight::load(&file, &format!("{p}.mlp.gate_proj.weight"), dt)?,
-                w_up: Weight::load(&file, &format!("{p}.mlp.up_proj.weight"), dt)?,
-                w_down: Weight::load(&file, &format!("{p}.mlp.down_proj.weight"), dt)?,
+                w_gate: Weight::load(&file, &format!("{p}.mlp.gate_proj.weight"), mlp_dt)?,
+                w_up: Weight::load(&file, &format!("{p}.mlp.up_proj.weight"), mlp_dt)?,
+                w_down: Weight::load(&file, &format!("{p}.mlp.down_proj.weight"), mlp_dt)?,
             });
         }
 
@@ -284,7 +311,7 @@ impl Qwen2 {
         ) -> Result<()> {
             let (kind, rows, cols, _) = w
                 .cache_bytes()
-                .ok_or_else(|| anyhow!("save_cache requires quantized weights (--dtype q8|q4)"))?;
+                .ok_or_else(|| anyhow!("save_cache requires quantized weights (--dtype q8|q4|q4k)"))?;
             specs.push(Spec { name, kind, rows, cols, small: None, weight: Some(w) });
             Ok(())
         }
