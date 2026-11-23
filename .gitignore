@@ -1,0 +1,8 @@
+/target
+/models
+*.safetensors
+*.bin
+*.gguf
+*.ymq
+__pycache__/
+*.pyc

@@ -1,0 +1,13 @@
+[package]
+name = "yesman-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "yesman"
+path = "src/main.rs"
+
+[dependencies]
+yesman-model.workspace = true
+anyhow.workspace = true
+clap.workspace = true
