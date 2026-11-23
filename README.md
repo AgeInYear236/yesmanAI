@@ -4,6 +4,8 @@ Inference for `Qwen2.5-1.5B-Instruct`, implemented from scratch in Rust.
 No ML frameworks: no torch, no candle, no burn, no BLAS. Only `safetensors`
 (container reader), `tokenizers` (BPE), `rayon`, `half`, `axum` for the server.
 
+> План развития, приоритеты и известные долги: **[ROADMAP.md](ROADMAP.md)**.
+
 ## Status
 
 | Stage | State |
