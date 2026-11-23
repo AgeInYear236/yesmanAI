@@ -365,3 +365,283 @@ void decode_attention_kernel(
     if (num_dims >= 3) out_h[lane + 64] = acc2 * inv_sum;
     if (num_dims >= 4) out_h[lane + 96] = acc3 * inv_sum;
 }
+
+// ----------------------------------------------------------------------------
+// Batched RoPE: rotates m tokens across all heads in parallel
+// Grid: (num_heads, m)
+// ----------------------------------------------------------------------------
+__attribute__((noinline))
+void rope_batched_kernel(
+    float* __restrict__ x,
+    const float* __restrict__ cos_tab,
+    const float* __restrict__ sin_tab,
+    int pos0,
+    int head_dim,
+    int num_heads,
+    int m
+) {
+    int h = 0;
+    asm("mov.u32 %0, %%ctaid.x;" : "=r"(h)); // head 0..num_heads-1
+    int row = 0;
+    asm("mov.u32 %0, %%ctaid.y;" : "=r"(row)); // token 0..m-1
+    int lane = 0;
+    asm("mov.u32 %0, %%tid.x;" : "=r"(lane));
+
+    if (h >= num_heads || row >= m) return;
+
+    int pos = pos0 + row;
+    int half = head_dim / 2;
+    int base = row * (num_heads * head_dim) + h * head_dim;
+
+    for (int tid = lane; tid < half; tid += 32) {
+        float c = cos_tab[pos * head_dim + tid];
+        float s = sin_tab[pos * head_dim + tid];
+        float a = x[base + tid];
+        float b = x[base + tid + half];
+        x[base + tid] = a * c - b * s;
+        x[base + tid + half] = b * c + a * s;
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Batched GEMM FP32: out[row, col] = sum(x[row, k] * w[col, k]) + (bias ? bias[col] : 0)
+// Grid: (n, m)
+// Vectorized 128-bit loads (4 floats per thread)
+// ----------------------------------------------------------------------------
+__attribute__((noinline))
+void gemm_f32_kernel(
+    float* __restrict__ out,
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ bias,
+    int k,
+    int n,
+    int m
+) {
+    int col = 0;
+    asm("mov.u32 %0, %%ctaid.x;" : "=r"(col)); // output feature 0..n-1
+    int row = 0;
+    asm("mov.u32 %0, %%ctaid.y;" : "=r"(row)); // token 0..m-1
+    int lane = 0;
+    asm("mov.u32 %0, %%tid.x;" : "=r"(lane));
+
+    if (col >= n || row >= m) return;
+
+    float sum = 0.0f;
+    const float* w_row = w + (long long)col * k;
+    const float* x_row = x + (long long)row * k;
+
+    typedef float float4_t __attribute__((ext_vector_type(4)));
+    int k4 = k / 4;
+    const float4_t* w4 = (const float4_t*)w_row;
+    const float4_t* x4 = (const float4_t*)x_row;
+
+    for (int i = lane; i < k4; i += 32) {
+        float4_t va = x4[i];
+        float4_t vb = w4[i];
+        sum += va[0] * vb[0] + va[1] * vb[1] + va[2] * vb[2] + va[3] * vb[3];
+    }
+
+    sum = warp_reduce_sum(sum);
+
+    if (lane == 0) {
+        if (bias != 0) {
+            sum += bias[col];
+        }
+        out[(long long)row * n + col] = sum;
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Batched GEMM Q8_0: out[row, col] = sum(x[row, k] * w[col, k])
+// Grid: (n, m)
+// ----------------------------------------------------------------------------
+__attribute__((noinline))
+void gemm_q8_kernel(
+    float* __restrict__ out,
+    const float* __restrict__ x,
+    const unsigned char* __restrict__ w_blocks,
+    const float* __restrict__ bias,
+    int k,
+    int n,
+    int m
+) {
+    int col = 0;
+    asm("mov.u32 %0, %%ctaid.x;" : "=r"(col)); // output feature 0..n-1
+    int row = 0;
+    asm("mov.u32 %0, %%ctaid.y;" : "=r"(row)); // token 0..m-1
+    int lane = 0;
+    asm("mov.u32 %0, %%tid.x;" : "=r"(lane));
+
+    if (col >= n || row >= m) return;
+
+    int num_blocks = k / 32;
+    const unsigned char* w_row = w_blocks + (long long)col * num_blocks * 36;
+    const float* x_row = x + (long long)row * k;
+
+    float total = 0.0f;
+
+    for (int b = 0; b < num_blocks; b++) {
+        const unsigned char* block_ptr = w_row + b * 36;
+        float d = *(const float*)block_ptr;
+        signed char q = (signed char)block_ptr[4 + lane];
+        float prod = x_row[b * 32 + lane] * (float)q;
+        float sum_b = warp_reduce_sum(prod);
+        if (lane == 0) {
+            total += d * sum_b;
+        }
+    }
+
+    if (lane == 0) {
+        if (bias != 0) {
+            total += bias[col];
+        }
+        out[(long long)row * n + col] = total;
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Batched GEMM Q4_K: out[row, col] = sum(x[row, k] * w[col, k])
+// Grid: (n, m)
+// ----------------------------------------------------------------------------
+__attribute__((noinline))
+void gemm_q4k_kernel(
+    float* __restrict__ out,
+    const float* __restrict__ x,
+    const unsigned char* __restrict__ w_blocks,
+    const float* __restrict__ bias,
+    int k,
+    int n,
+    int m
+) {
+    int col = 0;
+    asm("mov.u32 %0, %%ctaid.x;" : "=r"(col)); // output feature 0..n-1
+    int row = 0;
+    asm("mov.u32 %0, %%ctaid.y;" : "=r"(row)); // token 0..m-1
+    int lane = 0;
+    asm("mov.u32 %0, %%tid.x;" : "=r"(lane));
+
+    if (col >= n || row >= m) return;
+
+    int num_super_blocks = k / 256;
+    const unsigned char* w_row = w_blocks + (long long)col * num_super_blocks * 152;
+    const float* x_row = x + (long long)row * k;
+
+    float total = 0.0f;
+
+    for (int sb = 0; sb < num_super_blocks; sb++) {
+        const unsigned char* sb_ptr = w_row + sb * 152;
+        float d = *(const float*)(sb_ptr);
+        float dmin = *(const float*)(sb_ptr + 4);
+        const unsigned char* scales = sb_ptr + 8;
+        const unsigned char* qs = sb_ptr + 24;
+
+        const float* x_sb = x_row + sb * 256;
+
+        for (int j = 0; j < 8; j++) {
+            float sd = d * (float)scales[j];
+            float md = dmin * ((float)scales[8 + j] - 127.0f);
+
+            int byte_idx = (lane < 16) ? lane : (lane - 16);
+            unsigned char raw_byte = qs[j * 16 + byte_idx];
+            int nib = (lane < 16) ? (raw_byte & 0x0f) : (raw_byte >> 4);
+
+            float x_val = x_sb[j * 32 + lane];
+            float prod = x_val * (float)nib;
+
+            float sum_prod = warp_reduce_sum(prod);
+            float sum_x = warp_reduce_sum(x_val);
+
+            if (lane == 0) {
+                total += sd * sum_prod - md * sum_x;
+            }
+        }
+    }
+
+    if (lane == 0) {
+        if (bias != 0) {
+            total += bias[col];
+        }
+        out[(long long)row * n + col] = total;
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Batched Causal Attention: computes attention for all m tokens in parallel
+// Grid: (num_heads, m)
+// ----------------------------------------------------------------------------
+__attribute__((noinline))
+void causal_attention_batched_kernel(
+    float* __restrict__ out,
+    const float* __restrict__ q,
+    const float* __restrict__ kv_k,
+    const float* __restrict__ kv_v,
+    int head_dim,
+    int num_heads,
+    int group,
+    int kv_dim,
+    int pos0,
+    int m,
+    float scale
+) {
+    int h = 0;
+    asm("mov.u32 %0, %%ctaid.x;" : "=r"(h)); // head 0..num_heads-1
+    int row = 0;
+    asm("mov.u32 %0, %%ctaid.y;" : "=r"(row)); // token 0..m-1
+    int lane = 0;
+    asm("mov.u32 %0, %%tid.x;" : "=r"(lane));
+
+    if (h >= num_heads || row >= m) return;
+
+    int kv_h = h / group;
+    int t_end = pos0 + row + 1; // causal: attends to 0..t_end-1
+    const float* q_h = q + (long long)row * (num_heads * head_dim) + h * head_dim;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+    int num_dims = head_dim / 32;
+
+    float max_score = -1e30f;
+    float sum_exp = 0.0f;
+
+    for (int t = 0; t < t_end; t++) {
+        const float* k_t = kv_k + (long long)t * kv_dim + kv_h * head_dim;
+
+        float dot = 0.0f;
+        for (int d = lane; d < head_dim; d += 32) {
+            dot += q_h[d] * k_t[d];
+        }
+        dot = warp_reduce_sum(dot) * scale;
+        asm("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;" : "=f"(dot) : "f"(dot));
+
+        float p;
+        if (dot > max_score) {
+            float rescale = cuda_expf(max_score - dot);
+            acc0 *= rescale;
+            acc1 *= rescale;
+            acc2 *= rescale;
+            acc3 *= rescale;
+            sum_exp = sum_exp * rescale + 1.0f;
+            max_score = dot;
+            p = 1.0f;
+        } else {
+            p = cuda_expf(dot - max_score);
+            sum_exp += p;
+        }
+
+        const float* v_t = kv_v + (long long)t * kv_dim + kv_h * head_dim;
+        if (num_dims >= 1) acc0 += p * v_t[lane];
+        if (num_dims >= 2) acc1 += p * v_t[lane + 32];
+        if (num_dims >= 3) acc2 += p * v_t[lane + 64];
+        if (num_dims >= 4) acc3 += p * v_t[lane + 96];
+    }
+
+    float inv_sum = 1.0f / sum_exp;
+    float* out_h = out + (long long)row * (num_heads * head_dim) + h * head_dim;
+    if (num_dims >= 1) out_h[lane] = acc0 * inv_sum;
+    if (num_dims >= 2) out_h[lane + 32] = acc1 * inv_sum;
+    if (num_dims >= 3) out_h[lane + 64] = acc2 * inv_sum;
+    if (num_dims >= 4) out_h[lane + 96] = acc3 * inv_sum;
+}

@@ -467,20 +467,53 @@ fn rand_u64() -> u64 {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let cfg = Config::from_dir(&args.model)?;
-    let generation = GenerationConfig::from_dir(&args.model).unwrap_or_default();
+    let is_gguf = args.model.is_file()
+        && args
+            .model
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.eq_ignore_ascii_case("gguf"))
+            .unwrap_or(false);
+
+    let model_dir = if is_gguf {
+        args.model.parent().unwrap_or(std::path::Path::new("."))
+    } else {
+        args.model.as_path()
+    };
+
+    let (cfg, generation) = if is_gguf {
+        let temp_m = Qwen2::from_gguf(&args.model, args.ctx)?;
+        let c = temp_m.cfg.clone();
+        let g = GenerationConfig::from_dir(model_dir).unwrap_or_default();
+        (c, g)
+    } else {
+        let c = Config::from_dir(model_dir)?;
+        let g = GenerationConfig::from_dir(model_dir).unwrap_or_default();
+        (c, g)
+    };
+
     let dtype = DType::parse(&args.dtype)?;
     let t0 = Instant::now();
-    let root_model = match &args.cache {
-        Some(p) => Qwen2::from_cache(&args.model, args.ctx, p)?,
-        None => Qwen2::from_dir(&args.model, args.ctx, dtype)?,
+    let root_model = if is_gguf {
+        Qwen2::from_gguf(&args.model, args.ctx)?
+    } else {
+        match &args.cache {
+            Some(p) => Qwen2::from_cache(&args.model, args.ctx, p)?,
+            None => Qwen2::from_dir(&args.model, args.ctx, dtype)?,
+        }
     };
-    let dtype_name = if args.cache.is_some() {
+    let dtype_name = if is_gguf {
+        "GGUF".to_string()
+    } else if args.cache.is_some() {
         "cached".to_string()
     } else {
         dtype.name().to_string()
     };
-    let tok = Tokenizer::from_dir(&args.model)?;
+    let tok = if model_dir.join("tokenizer.json").exists() {
+        Tokenizer::from_dir(model_dir)?
+    } else {
+        Tokenizer::from_dir(std::path::Path::new("models/Qwen2.5-1.5B-Instruct"))?
+    };
     eprintln!(
         "loaded {} layers, {} weights in {:.2}s",
         cfg.num_hidden_layers,

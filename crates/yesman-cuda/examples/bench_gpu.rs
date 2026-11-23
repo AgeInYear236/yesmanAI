@@ -45,15 +45,12 @@ fn main() -> Result<()> {
     let prompt_ids = tok.encode(prompt)?;
     println!("\nPrompt: \"{prompt}\" ({} tokens)", prompt_ids.len());
 
-    // Prefill tokens through GPU
+    // Prefill tokens through GPU in a single batched pass
     let t_prefill = Instant::now();
-    let mut logits = Vec::new();
-    for (i, &t) in prompt_ids.iter().enumerate() {
-        logits = gpu_model.decode_step(t, i, &cpu_model)?;
-    }
+    let mut logits = gpu_model.prefill_chunk(&prompt_ids, 0, &cpu_model)?;
     let prefill_time = t_prefill.elapsed().as_secs_f32();
     println!(
-        "GPU Prefill done in {:.3}s ({:.1} tok/s)",
+        "GPU Batched Prefill done in {:.4}s ({:.1} tok/s)",
         prefill_time,
         prompt_ids.len() as f32 / prefill_time
     );

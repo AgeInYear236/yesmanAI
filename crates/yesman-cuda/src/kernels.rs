@@ -19,6 +19,11 @@ pub struct CudaKernels {
     pub gemv_q8: CUfunction,
     pub gemv_q4k: CUfunction,
     pub decode_attention: CUfunction,
+    pub rope_batched: CUfunction,
+    pub gemm_f32: CUfunction,
+    pub gemm_q8: CUfunction,
+    pub gemm_q4k: CUfunction,
+    pub causal_attention_batched: CUfunction,
     ctx: Arc<CudaContext>,
 }
 
@@ -36,6 +41,11 @@ impl CudaKernels {
         let gemv_q8 = module.get_kernel("gemv_q8_kernel")?;
         let gemv_q4k = module.get_kernel("gemv_q4k_kernel")?;
         let decode_attention = module.get_kernel("decode_attention_kernel")?;
+        let rope_batched = module.get_kernel("rope_batched_kernel")?;
+        let gemm_f32 = module.get_kernel("gemm_f32_kernel")?;
+        let gemm_q8 = module.get_kernel("gemm_q8_kernel")?;
+        let gemm_q4k = module.get_kernel("gemm_q4k_kernel")?;
+        let causal_attention_batched = module.get_kernel("causal_attention_batched_kernel")?;
 
         Ok(Self {
             module,
@@ -47,6 +57,11 @@ impl CudaKernels {
             gemv_q8,
             gemv_q4k,
             decode_attention,
+            rope_batched,
+            gemm_f32,
+            gemm_q8,
+            gemm_q4k,
+            causal_attention_batched,
             ctx,
         })
     }
@@ -335,6 +350,226 @@ impl CudaKernels {
                 self.decode_attention,
                 num_heads as u32,
                 1,
+                1,
+                32,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_batched(
+        &self,
+        x: &CudaBuffer<f32>,
+        cos_tab: &CudaBuffer<f32>,
+        sin_tab: &CudaBuffer<f32>,
+        pos0: usize,
+        head_dim: usize,
+        num_heads: usize,
+        m: usize,
+    ) -> Result<()> {
+        let pos_i32 = pos0 as i32;
+        let hd_i32 = head_dim as i32;
+        let nh_i32 = num_heads as i32;
+        let m_i32 = m as i32;
+        let mut args: [*mut std::ffi::c_void; 7] = [
+            &x.ptr as *const _ as *mut _,
+            &cos_tab.ptr as *const _ as *mut _,
+            &sin_tab.ptr as *const _ as *mut _,
+            &pos_i32 as *const _ as *mut _,
+            &hd_i32 as *const _ as *mut _,
+            &nh_i32 as *const _ as *mut _,
+            &m_i32 as *const _ as *mut _,
+        ];
+        unsafe {
+            (self.ctx.driver.cuLaunchKernel)(
+                self.rope_batched,
+                num_heads as u32,
+                m as u32,
+                1,
+                32,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f32(
+        &self,
+        out: &CudaBuffer<f32>,
+        x: &CudaBuffer<f32>,
+        w: &CudaBuffer<f32>,
+        bias: Option<&CudaBuffer<f32>>,
+        k: usize,
+        n: usize,
+        m: usize,
+    ) -> Result<()> {
+        let k_i32 = k as i32;
+        let n_i32 = n as i32;
+        let m_i32 = m as i32;
+        let bias_ptr = bias.map(|b| b.ptr).unwrap_or(0);
+        let mut args: [*mut std::ffi::c_void; 7] = [
+            &out.ptr as *const _ as *mut _,
+            &x.ptr as *const _ as *mut _,
+            &w.ptr as *const _ as *mut _,
+            &bias_ptr as *const _ as *mut _,
+            &k_i32 as *const _ as *mut _,
+            &n_i32 as *const _ as *mut _,
+            &m_i32 as *const _ as *mut _,
+        ];
+        unsafe {
+            (self.ctx.driver.cuLaunchKernel)(
+                self.gemm_f32,
+                n as u32,
+                m as u32,
+                1,
+                32,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_q8(
+        &self,
+        out: &CudaBuffer<f32>,
+        x: &CudaBuffer<f32>,
+        w_blocks: &CudaBuffer<u8>,
+        bias: Option<&CudaBuffer<f32>>,
+        k: usize,
+        n: usize,
+        m: usize,
+    ) -> Result<()> {
+        let k_i32 = k as i32;
+        let n_i32 = n as i32;
+        let m_i32 = m as i32;
+        let bias_ptr = bias.map(|b| b.ptr).unwrap_or(0);
+        let mut args: [*mut std::ffi::c_void; 7] = [
+            &out.ptr as *const _ as *mut _,
+            &x.ptr as *const _ as *mut _,
+            &w_blocks.ptr as *const _ as *mut _,
+            &bias_ptr as *const _ as *mut _,
+            &k_i32 as *const _ as *mut _,
+            &n_i32 as *const _ as *mut _,
+            &m_i32 as *const _ as *mut _,
+        ];
+        unsafe {
+            (self.ctx.driver.cuLaunchKernel)(
+                self.gemm_q8,
+                n as u32,
+                m as u32,
+                1,
+                32,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_q4k(
+        &self,
+        out: &CudaBuffer<f32>,
+        x: &CudaBuffer<f32>,
+        w_blocks: &CudaBuffer<u8>,
+        bias: Option<&CudaBuffer<f32>>,
+        k: usize,
+        n: usize,
+        m: usize,
+    ) -> Result<()> {
+        let k_i32 = k as i32;
+        let n_i32 = n as i32;
+        let m_i32 = m as i32;
+        let bias_ptr = bias.map(|b| b.ptr).unwrap_or(0);
+        let mut args: [*mut std::ffi::c_void; 7] = [
+            &out.ptr as *const _ as *mut _,
+            &x.ptr as *const _ as *mut _,
+            &w_blocks.ptr as *const _ as *mut _,
+            &bias_ptr as *const _ as *mut _,
+            &k_i32 as *const _ as *mut _,
+            &n_i32 as *const _ as *mut _,
+            &m_i32 as *const _ as *mut _,
+        ];
+        unsafe {
+            (self.ctx.driver.cuLaunchKernel)(
+                self.gemm_q4k,
+                n as u32,
+                m as u32,
+                1,
+                32,
+                1,
+                1,
+                0,
+                std::ptr::null_mut(),
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn causal_attention_batched(
+        &self,
+        out: &CudaBuffer<f32>,
+        q: &CudaBuffer<f32>,
+        kv_k: &CudaBuffer<f32>,
+        kv_v: &CudaBuffer<f32>,
+        head_dim: usize,
+        num_heads: usize,
+        group: usize,
+        kv_dim: usize,
+        pos0: usize,
+        m: usize,
+        scale: f32,
+    ) -> Result<()> {
+        let hd_i32 = head_dim as i32;
+        let nh_i32 = num_heads as i32;
+        let grp_i32 = group as i32;
+        let kvd_i32 = kv_dim as i32;
+        let pos_i32 = pos0 as i32;
+        let m_i32 = m as i32;
+        let mut args: [*mut std::ffi::c_void; 11] = [
+            &out.ptr as *const _ as *mut _,
+            &q.ptr as *const _ as *mut _,
+            &kv_k.ptr as *const _ as *mut _,
+            &kv_v.ptr as *const _ as *mut _,
+            &hd_i32 as *const _ as *mut _,
+            &nh_i32 as *const _ as *mut _,
+            &grp_i32 as *const _ as *mut _,
+            &kvd_i32 as *const _ as *mut _,
+            &pos_i32 as *const _ as *mut _,
+            &m_i32 as *const _ as *mut _,
+            &scale as *const _ as *mut _,
+        ];
+        unsafe {
+            (self.ctx.driver.cuLaunchKernel)(
+                self.causal_attention_batched,
+                num_heads as u32,
+                m as u32,
                 1,
                 32,
                 1,

@@ -99,10 +99,11 @@ Checked: bf16-логиты совпадают с независимым numpy-э
 - [x] **Набор PTX-ядер под Ampere (RTX 3060 sm_86)**:
   - `rmsnorm_kernel`: редукция варпа через hardware shuffle (`shfl.sync.down`), единый цикл без разделяемой памяти.
   - `swiglu_kernel`: аппаратный `ex2.approx.f32` для быстрого вычисления SiLU.
-  - `rope_kernel`: поворот Q и K прямо в регистрах GPU без промежуточных буферов.
+  - `rope_kernel` и `rope_batched_kernel`: поворот Q и K прямо в регистрах GPU без промежуточных буферов.
   - `residual_add_kernel`: векторное сложение на GPU.
   - `gemv_f32_kernel`, `gemv_q8_kernel`, `gemv_q4k_kernel`: параллельное умножение матриц квантованных весов на активации.
-  - `decode_attention_kernel`: GQA causal attention на GPU со встроенным online-softmax.
+  - `gemm_f32_kernel`, `gemm_q8_kernel`, `gemm_q4k_kernel`: 128-битные векторизованные GEMM-ядра для префилла батча токенов.
+  - `decode_attention_kernel` и `causal_attention_batched_kernel`: GQA causal attention на GPU со встроенным online-softmax (декодирование и батчевый префилл).
   - Проверено пошагово против CPU: максимальное расхождение логитов **1.4e-6** (одна миллионная!).
 - [x] **CudaQwen2 и разделяемые веса**:
   - Веса модели (1.6 ГБ для Q4_K_M) загружаются в VRAM **один раз** в `Arc<CudaQwen2Weights>`.
@@ -124,8 +125,10 @@ Checked: bf16-логиты совпадают с независимым numpy-э
 
 ## P3 — Экосистема и упаковка (opportunistic)
 
-- [ ] Экспорт `.ymq` ↔ **GGUF** (сейчас формат свой; совместимость с llama.cpp
-  даст возможность сравнивать качество/скорость напрямую).
+- [x] **Импорт GGUF (v2 / v3)**:
+  - Собственный парсер `GgufFile` в `yesman-core` без внешних библиотек (заголовок, метаданные, типы F32/F16/BF16/Q8_0/Q4_0, выравнивание, zero-copy mmap).
+  - Поддержка прямой загрузки моделей из `.gguf` файлов (`Qwen2::from_gguf`) в CLI и сервере: `./target/release/yesman --model model.gguf`.
+  - Успешная валидация в тестах (`gguf_forward_matches_safetensors`).
 - [ ] Отдельная команда `yesman convert --dtype q4km --out model.ymq` вместо
   флага `--save-cache` у генерации.
 - [ ] OpenAI `tools`/function-calling, `/v1/embeddings` (embed_tokens уже есть).

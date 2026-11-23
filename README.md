@@ -28,11 +28,12 @@ No ML frameworks: no torch, no candle, no burn, no BLAS. Only `safetensors`
 | Perplexity evaluation across all formats (WikiText-2) | done |
 | CUDA backend (zero-dependency, dynamic libcuda.so.1 driver API) | done (~22 tok/s on RTX 3060) |
 | Multi-session concurrent pool | done |
+| GGUF format loader (v2/v3, zero-copy mmap, F32/F16/BF16/Q8_0/Q4_0) | done |
 
 ## Layout
 
 ```
-crates/yesman-core     tensors, CPU kernels, safetensors reader, Q8/Q4_0/Q4_K, cache
+crates/yesman-core     tensors, CPU kernels, safetensors reader, GGUF parser, Q8/Q4_0/Q4_K, cache
   examples/diag_q4k.rs diagnostic: dequant RMSE of Q4_K vs Q4_0 on a fixture
 crates/yesman-cuda     zero-dependency CUDA driver API, PTX kernels, GPU execution
   examples/bench_gpu.rs  standalone GPU benchmark

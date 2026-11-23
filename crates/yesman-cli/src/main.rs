@@ -86,8 +86,30 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let cfg = Config::from_dir(&args.model)?;
-    let gen_cfg = GenerationConfig::from_dir(&args.model).unwrap_or_default();
+    let is_gguf = args.model.is_file()
+        && args
+            .model
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.eq_ignore_ascii_case("gguf"))
+            .unwrap_or(false);
+
+    let model_dir = if is_gguf {
+        args.model.parent().unwrap_or(std::path::Path::new("."))
+    } else {
+        args.model.as_path()
+    };
+
+    let (cfg, gen_cfg) = if is_gguf {
+        let temp_m = Qwen2::from_gguf(&args.model, args.ctx)?;
+        let c = temp_m.cfg.clone();
+        let g = GenerationConfig::from_dir(model_dir).unwrap_or_default();
+        (c, g)
+    } else {
+        let c = Config::from_dir(model_dir)?;
+        let g = GenerationConfig::from_dir(model_dir).unwrap_or_default();
+        (c, g)
+    };
 
     let mut sampler = Sampler::new(args.seed);
     sampler.temperature = args.temperature.or(gen_cfg.temperature).unwrap_or(0.7);
@@ -98,7 +120,11 @@ fn main() -> Result<()> {
         .or(gen_cfg.repetition_penalty)
         .unwrap_or(1.1);
 
-    let tok = Tokenizer::from_dir(&args.model)?;
+    let tok = if model_dir.join("tokenizer.json").exists() {
+        Tokenizer::from_dir(model_dir)?
+    } else {
+        Tokenizer::from_dir(std::path::Path::new("models/Qwen2.5-1.5B-Instruct"))?
+    };
 
     if args.print_ids {
         let ids = tok.encode(&prompt_text(&args))?;
@@ -114,9 +140,13 @@ fn main() -> Result<()> {
 
     let t0 = Instant::now();
     let dtype = DType::parse(&args.dtype)?;
-    let mut model = match &args.cache {
-        Some(p) => Qwen2::from_cache(&args.model, args.ctx, p)?,
-        None => Qwen2::from_dir(&args.model, args.ctx, dtype)?,
+    let mut model = if is_gguf {
+        Qwen2::from_gguf(&args.model, args.ctx)?
+    } else {
+        match &args.cache {
+            Some(p) => Qwen2::from_cache(&args.model, args.ctx, p)?,
+            None => Qwen2::from_dir(&args.model, args.ctx, dtype)?,
+        }
     };
     eprintln!(
         "loaded {} layers, hidden {}, {} heads / {} kv-heads, {} weights, in {:.2}s",
@@ -124,7 +154,9 @@ fn main() -> Result<()> {
         cfg.hidden_size,
         cfg.num_attention_heads,
         cfg.num_key_value_heads,
-        if args.cache.is_some() {
+        if is_gguf {
+            "GGUF"
+        } else if args.cache.is_some() {
             "cached"
         } else {
             dtype.name()

@@ -268,3 +268,36 @@ fn cloned_sessions_run_independently() {
         assert!((w - g).abs() < tol, "s1 logit {i}: {w} vs {g}");
     }
 }
+
+/// Loading a model directly from a GGUF file must yield identical logits
+/// to loading from safetensors.
+#[test]
+fn gguf_forward_matches_safetensors() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/tiny256");
+    let gguf_path = dir.join("model.gguf");
+    if !gguf_path.exists() {
+        return;
+    }
+    let raw = std::fs::read_to_string(dir.join("expected.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let ids: Vec<u32> = v["ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x: &serde_json::Value| x.as_u64().unwrap() as u32)
+        .collect();
+    let want: Vec<f32> = v["logits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x: &serde_json::Value| x.as_f64().unwrap() as f32)
+        .collect();
+
+    let mut m = Qwen2::from_gguf(&gguf_path, 64).unwrap();
+    let got = m.forward(&ids, 0);
+    assert_eq!(got.len(), want.len());
+    for (i, (w, g)) in want.iter().zip(got.iter()).enumerate() {
+        let diff = (w - g).abs();
+        assert!(diff < 1e-4, "logit {i} mismatch: want {w}, got {g}");
+    }
+}

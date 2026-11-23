@@ -9,7 +9,8 @@ use std::{path::Path, sync::Arc};
 use anyhow::{Context, Result, anyhow, bail};
 use rayon::prelude::*;
 use yesman_core::{
-    Bf16Tensor, Q4KTensor, Q4Tensor, Q8Tensor, SafeFile, Tensor, bf16, cache, ops, q4, q4k, quant,
+    Bf16Tensor, GgufFile, Q4KTensor, Q4Tensor, Q8Tensor, SafeFile, Tensor, bf16, cache, gguf, ops,
+    q4, q4k, quant,
 };
 
 use crate::{config::Config, kv::KvCache};
@@ -359,6 +360,150 @@ impl Qwen2 {
                 w_gate: Weight::from_cache(&c, &format!("{p}.mlp.gate_proj.weight"))?,
                 w_up: Weight::from_cache(&c, &format!("{p}.mlp.up_proj.weight"))?,
                 w_down: Weight::from_cache(&c, &format!("{p}.mlp.down_proj.weight"))?,
+            });
+        }
+
+        let rope_len = max_ctx.max(cfg.max_position_embeddings);
+        let (cos, sin) = ops::rope_tables(rope_len, cfg.head_dim(), cfg.rope_theta);
+        let kv = KvCache::new(cfg.num_hidden_layers, max_ctx, cfg.kv_dim());
+        let ws = Workspace::new(&cfg);
+        let weights = Arc::new(Qwen2Weights {
+            cfg: cfg.clone(),
+            embed,
+            final_norm,
+            layers,
+            cos,
+            sin,
+        });
+        Ok(Self {
+            cfg,
+            weights,
+            kv,
+            ws,
+        })
+    }
+
+    /// Load directly from a standard GGUF binary file (v2 / v3), as exported by llama.cpp / HuggingFace.
+    pub fn from_gguf(path: &Path, max_ctx: usize) -> Result<Self> {
+        let gguf = GgufFile::open(path)?;
+        let arch = gguf.metadata_str("general.architecture").unwrap_or("qwen2");
+        if arch != "qwen2" {
+            bail!("unsupported GGUF architecture `{arch}` (expected qwen2)");
+        }
+
+        let embed_info = gguf
+            .tensor_info("token_embd.weight")
+            .ok_or_else(|| anyhow!("token_embd.weight missing in GGUF"))?;
+        let vocab_size = embed_info.shape[0];
+        let hidden_size = embed_info.shape[1];
+
+        let cfg = Config {
+            hidden_size,
+            intermediate_size: gguf
+                .metadata_u32("qwen2.feed_forward_length")
+                .unwrap_or(8960) as usize,
+            num_hidden_layers: gguf
+                .metadata_u32("qwen2.block_count")
+                .ok_or_else(|| anyhow!("missing qwen2.block_count in GGUF metadata"))?
+                as usize,
+            num_attention_heads: gguf
+                .metadata_u32("qwen2.attention.head_count")
+                .unwrap_or(12) as usize,
+            num_key_value_heads: gguf
+                .metadata_u32("qwen2.attention.head_count_kv")
+                .unwrap_or(2) as usize,
+            vocab_size,
+            rms_norm_eps: gguf
+                .metadata_f32("qwen2.attention.layer_norm_rms_epsilon")
+                .unwrap_or(1e-6),
+            max_position_embeddings: gguf.metadata_u32("qwen2.context_length").unwrap_or(32768)
+                as usize,
+            rope_theta: gguf
+                .metadata_f32("qwen2.rope.freq_base")
+                .unwrap_or(1000000.0),
+            tie_word_embeddings: true,
+            bos_token_id: gguf
+                .metadata_u32("tokenizer.ggml.bos_token_id")
+                .unwrap_or(151643),
+            eos_token_id: Some(serde_json::Value::Number(serde_json::Number::from(
+                gguf.metadata_u32("tokenizer.ggml.eos_token_id")
+                    .unwrap_or(151645),
+            ))),
+        };
+
+        let load_f32_vec = |name: &str| -> Result<Vec<f32>> {
+            let info = gguf
+                .tensor_info(name)
+                .ok_or_else(|| anyhow!("tensor {name} missing in GGUF"))?;
+            let data = gguf.tensor_data(name)?;
+            if info.ggml_type != gguf::GGML_TYPE_F32 {
+                bail!("tensor {name} expected F32, got {}", info.ggml_type);
+            }
+            let n_floats: usize = info.shape.iter().product();
+            let mut out = vec![0.0f32; n_floats];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr() as *const f32,
+                    out.as_mut_ptr(),
+                    n_floats,
+                );
+            }
+            Ok(out)
+        };
+
+        let load_weight = |name: &str| -> Result<Weight> {
+            let info = gguf
+                .tensor_info(name)
+                .ok_or_else(|| anyhow!("tensor {name} missing in GGUF"))?;
+            let data = gguf.tensor_data(name)?;
+            let rows = info.shape[0];
+            let cols = info.shape[1];
+            match info.ggml_type {
+                gguf::GGML_TYPE_F32 => {
+                    let n = rows * cols;
+                    let mut v = vec![0.0f32; n];
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            data.as_ptr() as *const f32,
+                            v.as_mut_ptr(),
+                            n,
+                        );
+                    }
+                    Ok(Weight::F32(Tensor {
+                        data: v,
+                        shape: vec![rows, cols],
+                    }))
+                }
+                gguf::GGML_TYPE_Q8_0 => {
+                    let expected_bytes = (rows * cols / quant::BLOCK) * 36;
+                    Ok(Weight::Q8(Q8Tensor::from_bytes(
+                        rows,
+                        cols,
+                        &data[..expected_bytes],
+                    )))
+                }
+                other => bail!("unsupported tensor {name} GGML type {other}"),
+            }
+        };
+
+        let embed = load_weight("token_embd.weight")?;
+        let final_norm = load_f32_vec("output_norm.weight")?;
+
+        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+        for i in 0..cfg.num_hidden_layers {
+            layers.push(Layer {
+                in_norm: load_f32_vec(&format!("blk.{i}.attn_norm.weight"))?,
+                post_norm: load_f32_vec(&format!("blk.{i}.ffn_norm.weight"))?,
+                wq: load_weight(&format!("blk.{i}.attn_q.weight"))?,
+                wk: load_weight(&format!("blk.{i}.attn_k.weight"))?,
+                wv: load_weight(&format!("blk.{i}.attn_v.weight"))?,
+                wo: load_weight(&format!("blk.{i}.attn_output.weight"))?,
+                bq: load_f32_vec(&format!("blk.{i}.attn_q.bias"))?,
+                bk: load_f32_vec(&format!("blk.{i}.attn_k.bias"))?,
+                bv: load_f32_vec(&format!("blk.{i}.attn_v.bias"))?,
+                w_gate: load_weight(&format!("blk.{i}.ffn_gate.weight"))?,
+                w_up: load_weight(&format!("blk.{i}.ffn_up.weight"))?,
+                w_down: load_weight(&format!("blk.{i}.ffn_down.weight"))?,
             });
         }
 

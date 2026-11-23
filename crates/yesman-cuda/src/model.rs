@@ -8,6 +8,8 @@ use crate::{
     kernels::CudaKernels,
 };
 
+pub const GPU_PREFILL_CHUNK: usize = 512;
+
 pub struct CudaLayer {
     pub in_norm: CudaBuffer<f32>,
     pub post_norm: CudaBuffer<f32>,
@@ -74,6 +76,28 @@ impl CudaWeight {
             }
             Self::Q4K { buf, rows, cols } => {
                 kernels.gemv_q4k(out, x, buf, bias, *cols, *rows)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn gemm(
+        &self,
+        kernels: &CudaKernels,
+        out: &CudaBuffer<f32>,
+        x: &CudaBuffer<f32>,
+        bias: Option<&CudaBuffer<f32>>,
+        m: usize,
+    ) -> Result<()> {
+        match self {
+            Self::F32 { buf, rows, cols } => {
+                kernels.gemm_f32(out, x, buf, bias, *cols, *rows, m)?;
+            }
+            Self::Q8 { buf, rows, cols } => {
+                kernels.gemm_q8(out, x, buf, bias, *cols, *rows, m)?;
+            }
+            Self::Q4K { buf, rows, cols } => {
+                kernels.gemm_q4k(out, x, buf, bias, *cols, *rows, m)?;
             }
         }
         Ok(())
@@ -183,6 +207,7 @@ impl CudaQwen2Weights {
             kv_v.push(self.ctx.alloc::<f32>(max_ctx * kv_dim)?);
         }
 
+        // Single-token decode scratchpad
         let x = self.ctx.alloc::<f32>(h)?;
         let hb = self.ctx.alloc::<f32>(h)?;
         let q = self.ctx.alloc::<f32>(h)?;
@@ -195,6 +220,20 @@ impl CudaQwen2Weights {
         let act = self.ctx.alloc::<f32>(inter)?;
         let down = self.ctx.alloc::<f32>(h)?;
         let logits = self.ctx.alloc::<f32>(vocab)?;
+
+        // Batched prefill scratchpad (up to GPU_PREFILL_CHUNK tokens in parallel)
+        let pm = GPU_PREFILL_CHUNK;
+        let pre_x = self.ctx.alloc::<f32>(pm * h)?;
+        let pre_hb = self.ctx.alloc::<f32>(pm * h)?;
+        let pre_q = self.ctx.alloc::<f32>(pm * h)?;
+        let pre_k = self.ctx.alloc::<f32>(pm * kv_dim)?;
+        let pre_v = self.ctx.alloc::<f32>(pm * kv_dim)?;
+        let pre_attn = self.ctx.alloc::<f32>(pm * h)?;
+        let pre_o = self.ctx.alloc::<f32>(pm * h)?;
+        let pre_gate = self.ctx.alloc::<f32>(pm * inter)?;
+        let pre_up = self.ctx.alloc::<f32>(pm * inter)?;
+        let pre_act = self.ctx.alloc::<f32>(pm * inter)?;
+        let pre_down = self.ctx.alloc::<f32>(pm * h)?;
 
         Ok(CudaQwen2 {
             weights: Arc::clone(self),
@@ -214,6 +253,17 @@ impl CudaQwen2Weights {
             act,
             down,
             logits,
+            pre_x,
+            pre_hb,
+            pre_q,
+            pre_k,
+            pre_v,
+            pre_attn,
+            pre_o,
+            pre_gate,
+            pre_up,
+            pre_act,
+            pre_down,
         })
     }
 }
@@ -229,7 +279,7 @@ pub struct CudaQwen2 {
     pub max_ctx: usize,
     pub kv_len: usize,
 
-    // Reused GPU scratchpad buffers
+    // Reused single-token GPU scratchpad buffers
     pub x: CudaBuffer<f32>,
     pub hb: CudaBuffer<f32>,
     pub q: CudaBuffer<f32>,
@@ -242,6 +292,19 @@ pub struct CudaQwen2 {
     pub act: CudaBuffer<f32>,
     pub down: CudaBuffer<f32>,
     pub logits: CudaBuffer<f32>,
+
+    // Reused batched prefill GPU scratchpad buffers
+    pub pre_x: CudaBuffer<f32>,
+    pub pre_hb: CudaBuffer<f32>,
+    pub pre_q: CudaBuffer<f32>,
+    pub pre_k: CudaBuffer<f32>,
+    pub pre_v: CudaBuffer<f32>,
+    pub pre_attn: CudaBuffer<f32>,
+    pub pre_o: CudaBuffer<f32>,
+    pub pre_gate: CudaBuffer<f32>,
+    pub pre_up: CudaBuffer<f32>,
+    pub pre_act: CudaBuffer<f32>,
+    pub pre_down: CudaBuffer<f32>,
 }
 
 unsafe impl Send for CudaQwen2 {}
@@ -396,6 +459,182 @@ impl CudaQwen2 {
         self.logits.to_vec()
     }
 
+    /// Batched prefill on GPU: runs all `tokens` in chunks up to `GPU_PREFILL_CHUNK`
+    /// using parallel GEMM kernels and batched causal attention in a single pass.
+    pub fn prefill_chunk(
+        &mut self,
+        tokens: &[u32],
+        pos0: usize,
+        cpu_embed: &Qwen2,
+    ) -> Result<Vec<f32>> {
+        let m = tokens.len();
+        assert!(m > 0 && m <= GPU_PREFILL_CHUNK);
+        self.weights.ctx.set_current()?;
+        let cfg = &self.weights.cfg;
+        let h = cfg.hidden_size;
+        let hd = cfg.head_dim();
+        let n_heads = cfg.num_attention_heads;
+        let kv_dim = cfg.kv_dim();
+        let group = cfg.gqa_group();
+        let eps = cfg.rms_norm_eps;
+        let scale = 1.0f32 / (hd as f32).sqrt();
+
+        // 1. Gather all m embedding rows on host and copy to GPU in ONE transfer
+        let mut host_embed = Vec::with_capacity(m * h);
+        for &t in tokens {
+            let row = cpu_embed.gather_embed(t as usize);
+            host_embed.extend_from_slice(&row);
+        }
+        self.pre_x.copy_from_host(&host_embed)?;
+
+        // 2. Transformer layers in parallel for all m tokens
+        for (li, layer) in self.weights.layers.iter().enumerate() {
+            // Attention pre-norm (all m rows in parallel)
+            self.weights
+                .kernels
+                .rmsnorm(&self.pre_hb, &self.pre_x, &layer.in_norm, m, h, eps)?;
+
+            // Q, K, V GEMMs (shape [m, h] -> [m, h] and [m, kv_dim])
+            layer.wq.gemm(
+                &self.weights.kernels,
+                &self.pre_q,
+                &self.pre_hb,
+                Some(&layer.bq),
+                m,
+            )?;
+            layer.wk.gemm(
+                &self.weights.kernels,
+                &self.pre_k,
+                &self.pre_hb,
+                Some(&layer.bk),
+                m,
+            )?;
+            layer.wv.gemm(
+                &self.weights.kernels,
+                &self.pre_v,
+                &self.pre_hb,
+                Some(&layer.bv),
+                m,
+            )?;
+
+            // Batched RoPE across all m tokens
+            self.weights.kernels.rope_batched(
+                &self.pre_q,
+                &self.weights.cos_tab,
+                &self.weights.sin_tab,
+                pos0,
+                hd,
+                n_heads,
+                m,
+            )?;
+            self.weights.kernels.rope_batched(
+                &self.pre_k,
+                &self.weights.cos_tab,
+                &self.weights.sin_tab,
+                pos0,
+                hd,
+                cfg.num_key_value_heads,
+                m,
+            )?;
+
+            // Write all m keys and values into KV cache starting at offset pos0
+            let k_offset = (pos0 * kv_dim * std::mem::size_of::<f32>()) as u64;
+            let v_offset = (pos0 * kv_dim * std::mem::size_of::<f32>()) as u64;
+            let byte_count = m * kv_dim * std::mem::size_of::<f32>();
+            unsafe {
+                (self.weights.ctx.driver.cuMemcpyDtoD)(
+                    self.kv_k[li].ptr + k_offset,
+                    self.pre_k.ptr,
+                    byte_count,
+                );
+                (self.weights.ctx.driver.cuMemcpyDtoD)(
+                    self.kv_v[li].ptr + v_offset,
+                    self.pre_v.ptr,
+                    byte_count,
+                );
+            }
+
+            // Batched Causal Attention on GPU
+            self.weights.kernels.causal_attention_batched(
+                &self.pre_attn,
+                &self.pre_q,
+                &self.kv_k[li],
+                &self.kv_v[li],
+                hd,
+                n_heads,
+                group,
+                kv_dim,
+                pos0,
+                m,
+                scale,
+            )?;
+
+            // Output projection GEMM
+            layer
+                .wo
+                .gemm(&self.weights.kernels, &self.pre_o, &self.pre_attn, None, m)?;
+            self.weights
+                .kernels
+                .residual_add(&self.pre_x, &self.pre_o, m * h)?;
+
+            // FFN pre-norm
+            self.weights
+                .kernels
+                .rmsnorm(&self.pre_hb, &self.pre_x, &layer.post_norm, m, h, eps)?;
+
+            // MLP gate and up GEMMs
+            layer
+                .w_gate
+                .gemm(&self.weights.kernels, &self.pre_gate, &self.pre_hb, None, m)?;
+            layer
+                .w_up
+                .gemm(&self.weights.kernels, &self.pre_up, &self.pre_hb, None, m)?;
+
+            // SwiGLU activation
+            self.weights.kernels.swiglu(
+                &self.pre_act,
+                &self.pre_gate,
+                &self.pre_up,
+                m * cfg.intermediate_size,
+            )?;
+
+            // MLP down GEMM
+            layer.w_down.gemm(
+                &self.weights.kernels,
+                &self.pre_down,
+                &self.pre_act,
+                None,
+                m,
+            )?;
+            self.weights
+                .kernels
+                .residual_add(&self.pre_x, &self.pre_down, m * h)?;
+        }
+
+        self.kv_len = pos0 + m;
+
+        // Extract logits for the last token (token m - 1)
+        let last_offset = ((m - 1) * h * std::mem::size_of::<f32>()) as u64;
+        unsafe {
+            (self.weights.ctx.driver.cuMemcpyDtoD)(
+                self.x.ptr,
+                self.pre_x.ptr + last_offset,
+                h * std::mem::size_of::<f32>(),
+            );
+        }
+
+        // Final norm & LM head for the last token
+        self.weights
+            .kernels
+            .rmsnorm(&self.hb, &self.x, &self.weights.final_norm, 1, h, eps)?;
+        self.weights
+            .embed
+            .gemv(&self.weights.kernels, &self.logits, &self.hb, None)?;
+
+        self.weights.ctx.synchronize()?;
+        self.logits.to_vec()
+    }
+
     pub fn generate(
         &mut self,
         tok: &Tokenizer,
@@ -415,13 +654,16 @@ impl CudaQwen2 {
         self.reset();
         let mut history = prompt_ids.to_vec();
         let mut logits = Vec::new();
-        for (i, &t) in prompt_ids.iter().enumerate() {
-            logits = self.decode_step(t, i, cpu_model)?;
+
+        // Batched prefill on GPU (chunks of up to GPU_PREFILL_CHUNK tokens in parallel)
+        let mut pos = 0usize;
+        for chunk in prompt_ids.chunks(GPU_PREFILL_CHUNK) {
+            logits = self.prefill_chunk(chunk, pos, cpu_model)?;
+            pos += chunk.len();
         }
 
         let mut out_ids: Vec<u32> = Vec::new();
         let mut text = String::new();
-        let mut pos = prompt_ids.len();
 
         for _ in 0..opts.max_new_tokens {
             let next = sampler.sample(&mut logits, &history);
