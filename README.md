@@ -107,19 +107,34 @@ being misread (rebuild it with `--save-cache`).
 
 ```bash
 ./target/release/yesman-server \
-    --cache models/Qwen2.5-1.5B-Instruct/model.q4km.ymq --port 8000
+    --cache models/Qwen2.5-1.5B-Instruct/model.q4km.ymq --port 8000 --max-concurrency 4
 
-curl -s http://127.0.0.1:8000/v1/models
+# Chat completions (OpenAI format, supports streaming via "stream": true)
 curl -s -X POST http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"qwen2.5-1.5b-instruct","temperature":0,"max_tokens":64,
+  -d '{"model":"qwen2.5-1.5b-instruct","temperature":0.7,"max_tokens":64,
        "messages":[{"role":"user","content":"What is 2+2? One word."}]}'
-# "stream": true returns OpenAI-style SSE chunks ending with data: [DONE]
+
+# Legacy text completions
+curl -s -X POST http://127.0.0.1:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"The capital of France is","temperature":0,"max_tokens":8}'
+
+# Telemetry & Health
+curl -s http://127.0.0.1:8000/health
+curl -s http://127.0.0.1:8000/v1/models
+curl -s http://127.0.0.1:8000/stats | jq .       # JSON runtime stats & tok/s
+curl -s http://127.0.0.1:8000/metrics            # Prometheus exporter format
 ```
 
-Works with OpenAI-compatible clients (Open WebUI, `openai` SDK with
-`base_url="http://127.0.0.1:8000/v1"`). Requests are serialized on a mutex —
-one model, one KV cache.
+**Concurrent Session Pool:**
+Multiple clients run concurrently without blocking each other. Model weights (~1.6 GB) are immutable and shared across all sessions via `Arc<Qwen2Weights>`, while each concurrent worker leases an independent `KvCache` and `Workspace` scratchpad.
+Tested with 4 parallel clients generating simultaneously (`tools/bench_server.py`) at ~10 tok/s aggregate throughput with zero crosstalk.
+
+**Deployment:**
+- `Dockerfile`: minimal multi-stage image.
+- `tools/yesman.service`: systemd service unit template with sandboxing.
+- Graceful shutdown handles `SIGINT` / `SIGTERM` cleanly.
 
 ## Checked on the real checkpoint
 

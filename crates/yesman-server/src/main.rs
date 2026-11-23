@@ -1,8 +1,11 @@
 //! OpenAI-compatible HTTP server for the pure-Rust Qwen2 inference engine.
 //!
-//!   POST /v1/chat/completions   (streaming via SSE supported)
-//!   GET  /v1/models
-//!   GET  /health
+//!   POST /v1/chat/completions   (JSON & streaming SSE)
+//!   POST /v1/completions        (legacy text completions, JSON & streaming SSE)
+//!   GET  /v1/models             (model listing)
+//!   GET  /health                (health check)
+//!   GET  /metrics               (Prometheus metrics)
+//!   GET  /stats                 (JSON runtime stats)
 
 use std::{
     convert::Infallible,
@@ -11,7 +14,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Result, anyhow};
@@ -38,8 +41,12 @@ struct Args {
     /// f32 | bf16 | q8 | q4 | q4k (all 4-bit) | q4km (FFN in Q8, best quality)
     #[arg(long, default_value = "bf16")]
     dtype: String,
+    /// Context window size per session
     #[arg(long, default_value_t = 4096)]
     ctx: usize,
+    /// Maximum concurrent model sessions running in parallel (default: 4)
+    #[arg(long, default_value_t = 4)]
+    max_concurrency: usize,
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
     #[arg(long, default_value_t = 8000)]
@@ -52,23 +59,119 @@ struct Args {
     cache: Option<PathBuf>,
 }
 
+/// Pool of reusable Qwen2 sessions sharing immutable model weights via `Arc`.
+struct SessionPool {
+    root: Qwen2,
+    ctx: usize,
+    idle: Mutex<Vec<Qwen2>>,
+    sem: Arc<tokio::sync::Semaphore>,
+    max_sessions: usize,
+}
+
+impl SessionPool {
+    fn new(root: Qwen2, ctx: usize, max_sessions: usize) -> Self {
+        let max_sessions = max_sessions.max(1);
+        Self {
+            root,
+            ctx,
+            idle: Mutex::new(Vec::new()),
+            sem: Arc::new(tokio::sync::Semaphore::new(max_sessions)),
+            max_sessions,
+        }
+    }
+
+    async fn acquire(&self) -> Result<(Qwen2, tokio::sync::OwnedSemaphorePermit)> {
+        let permit = Arc::clone(&self.sem)
+            .acquire_owned()
+            .await
+            .map_err(|e| anyhow!("semaphore closed: {e}"))?;
+        let session = {
+            let mut idle = self.idle.lock().unwrap();
+            idle.pop()
+                .unwrap_or_else(|| self.root.clone_session(self.ctx))
+        };
+        Ok((session, permit))
+    }
+
+    fn release(&self, mut session: Qwen2, permit: tokio::sync::OwnedSemaphorePermit) {
+        session.reset();
+        {
+            let mut idle = self.idle.lock().unwrap();
+            idle.push(session);
+        }
+        drop(permit);
+    }
+}
+
+/// Runtime metrics and telemetry counters.
+struct ServerMetrics {
+    start_time: Instant,
+    chat_requests: AtomicU64,
+    text_requests: AtomicU64,
+    active_requests: AtomicU64,
+    prompt_tokens: AtomicU64,
+    completion_tokens: AtomicU64,
+    total_decode_time_ms: AtomicU64,
+}
+
+impl ServerMetrics {
+    fn new() -> Self {
+        Self {
+            start_time: Instant::now(),
+            chat_requests: AtomicU64::new(0),
+            text_requests: AtomicU64::new(0),
+            active_requests: AtomicU64::new(0),
+            prompt_tokens: AtomicU64::new(0),
+            completion_tokens: AtomicU64::new(0),
+            total_decode_time_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn record_completion(
+        &self,
+        prompt_len: usize,
+        comp_len: usize,
+        duration_ms: u64,
+        is_chat: bool,
+    ) {
+        if is_chat {
+            self.chat_requests.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.text_requests.fetch_add(1, Ordering::Relaxed);
+        }
+        self.prompt_tokens
+            .fetch_add(prompt_len as u64, Ordering::Relaxed);
+        self.completion_tokens
+            .fetch_add(comp_len as u64, Ordering::Relaxed);
+        self.total_decode_time_ms
+            .fetch_add(duration_ms, Ordering::Relaxed);
+    }
+}
+
 struct Inner {
-    model: Mutex<Qwen2>,
+    pool: SessionPool,
     tok: Tokenizer,
     cfg: Config,
     generation: GenerationConfig,
     model_id: String,
+    dtype_name: String,
     ctx: usize,
     seq: AtomicU64,
+    metrics: ServerMetrics,
 }
 
 #[derive(Clone)]
 struct AppState(Arc<Inner>);
 
 impl AppState {
-    fn id(&self) -> String {
+    fn chat_id(&self) -> String {
         let n = self.0.seq.fetch_add(1, Ordering::Relaxed);
         format!("chatcmpl-{n:x}")
+    }
+
+    fn completion_id(&self) -> String {
+        let n = self.0.seq.fetch_add(1, Ordering::Relaxed);
+        format!("cmpl-{n:x}")
     }
 }
 
@@ -91,6 +194,43 @@ struct ChatRequest {
     seed: Option<u64>,
     #[serde(default)]
     stream: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompletionRequest {
+    #[serde(default)]
+    model: Option<String>,
+    prompt: Value,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    top_k: Option<usize>,
+    #[serde(default)]
+    max_tokens: Option<usize>,
+    #[serde(default)]
+    repetition_penalty: Option<f32>,
+    #[serde(default)]
+    seed: Option<u64>,
+    #[serde(default)]
+    stream: bool,
+    #[serde(default)]
+    stop: Option<Value>,
+}
+
+impl CompletionRequest {
+    fn prompt_str(&self) -> String {
+        match &self.prompt {
+            Value::String(s) => s.clone(),
+            Value::Array(arr) => arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(""),
+            other => other.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -140,10 +280,11 @@ struct RequestPlan {
     sampler: Sampler,
     id: String,
     model_id: String,
+    is_chat: bool,
 }
 
 impl AppState {
-    fn plan(&self, req: &ChatRequest) -> Result<RequestPlan> {
+    fn plan_chat(&self, req: &ChatRequest) -> Result<RequestPlan> {
         if req.messages.is_empty() {
             return Err(anyhow!("messages must not be empty"));
         }
@@ -151,7 +292,14 @@ impl AppState {
         let prompt = chat::render(&messages);
         let prompt_ids = self.0.tok.encode(&prompt)?;
         let mut stop = self.0.cfg.eos_ids();
-        if let Some(id) = self.0.tok.id_of(chat::IM_END) {
+        if let Some(id) = self.0.tok.id_of(chat::IM_END)
+            && !stop.contains(&id)
+        {
+            stop.push(id);
+        }
+        if let Some(id) = self.0.tok.id_of("<|endoftext|>")
+            && !stop.contains(&id)
+        {
             stop.push(id);
         }
         let max_ctx = self.0.ctx;
@@ -180,15 +328,87 @@ impl AppState {
             prompt_ids,
             opts,
             sampler: s,
-            id: self.id(),
-            // Echo the model the client asked for; OpenAI clients expect that.
+            id: self.chat_id(),
             model_id: req.model.clone().unwrap_or_else(|| self.0.model_id.clone()),
+            is_chat: true,
+        })
+    }
+
+    fn plan_completion(&self, req: &CompletionRequest) -> Result<RequestPlan> {
+        let prompt = req.prompt_str();
+        if prompt.is_empty() {
+            return Err(anyhow!("prompt must not be empty"));
+        }
+        let prompt_ids = self.0.tok.encode(&prompt)?;
+        let mut stop = self.0.cfg.eos_ids();
+        if let Some(id) = self.0.tok.id_of(chat::IM_END)
+            && !stop.contains(&id)
+        {
+            stop.push(id);
+        }
+        if let Some(id) = self.0.tok.id_of("<|endoftext|>")
+            && !stop.contains(&id)
+        {
+            stop.push(id);
+        }
+
+        if let Some(stop_val) = &req.stop {
+            match stop_val {
+                Value::String(s) => {
+                    if let Some(id) = self.0.tok.id_of(s)
+                        && !stop.contains(&id)
+                    {
+                        stop.push(id);
+                    }
+                }
+                Value::Array(arr) => {
+                    for v in arr {
+                        if let Some(s) = v.as_str()
+                            && let Some(id) = self.0.tok.id_of(s)
+                            && !stop.contains(&id)
+                        {
+                            stop.push(id);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let max_ctx = self.0.ctx;
+        let opts = GenerateOptions {
+            max_new_tokens: req
+                .max_tokens
+                .unwrap_or(512)
+                .min(max_ctx.saturating_sub(prompt_ids.len())),
+            stop_ids: stop,
+            max_ctx,
+        };
+
+        let mut s = Sampler::new(req.seed.unwrap_or_else(rand_u64));
+        s.temperature = req
+            .temperature
+            .or(self.0.generation.temperature)
+            .unwrap_or(0.7);
+        s.top_p = req.top_p.or(self.0.generation.top_p).unwrap_or(0.8);
+        s.top_k = req.top_k.or(self.0.generation.top_k).unwrap_or(20);
+        s.repetition_penalty = req
+            .repetition_penalty
+            .or(self.0.generation.repetition_penalty)
+            .unwrap_or(1.1);
+
+        Ok(RequestPlan {
+            prompt_ids,
+            opts,
+            sampler: s,
+            id: self.completion_id(),
+            model_id: req.model.clone().unwrap_or_else(|| self.0.model_id.clone()),
+            is_chat: false,
         })
     }
 }
 
 fn rand_u64() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -201,45 +421,85 @@ async fn main() -> Result<()> {
     let cfg = Config::from_dir(&args.model)?;
     let generation = GenerationConfig::from_dir(&args.model).unwrap_or_default();
     let dtype = DType::parse(&args.dtype)?;
-    let t0 = std::time::Instant::now();
-    let model = match &args.cache {
+    let t0 = Instant::now();
+    let root_model = match &args.cache {
         Some(p) => Qwen2::from_cache(&args.model, args.ctx, p)?,
         None => Qwen2::from_dir(&args.model, args.ctx, dtype)?,
+    };
+    let dtype_name = if args.cache.is_some() {
+        "cached".to_string()
+    } else {
+        dtype.name().to_string()
     };
     let tok = Tokenizer::from_dir(&args.model)?;
     eprintln!(
         "loaded {} layers, {} weights in {:.2}s",
         cfg.num_hidden_layers,
-        if args.cache.is_some() {
-            "cached"
-        } else {
-            dtype.name()
-        },
+        dtype_name,
         t0.elapsed().as_secs_f32()
     );
 
+    let pool = SessionPool::new(root_model, args.ctx, args.max_concurrency);
+    eprintln!(
+        "initialized session pool: max_concurrency={}, ctx={}",
+        args.max_concurrency, args.ctx
+    );
+
     let state = AppState(Arc::new(Inner {
-        model: Mutex::new(model),
+        pool,
         tok,
         cfg,
         generation,
         model_id: args.model_id,
+        dtype_name,
         ctx: args.ctx,
         seq: AtomicU64::new(0),
+        metrics: ServerMetrics::new(),
     }));
 
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/completions", post(text_completions))
+        .route("/metrics", get(metrics_handler))
+        .route("/stats", get(stats_handler))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
     let addr = format!("{}:{}", args.host, args.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!("yesman-server listening on http://{addr}");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    println!("yesman-server stopped cleanly.");
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    eprintln!("\nreceived shutdown signal, draining active requests...");
 }
 
 async fn health() -> &'static str {
@@ -258,6 +518,80 @@ async fn models(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
+async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let m = &state.0.metrics;
+    let chat_req = m.chat_requests.load(Ordering::Relaxed);
+    let text_req = m.text_requests.load(Ordering::Relaxed);
+    let active = m.active_requests.load(Ordering::Relaxed);
+    let prompt_tok = m.prompt_tokens.load(Ordering::Relaxed);
+    let comp_tok = m.completion_tokens.load(Ordering::Relaxed);
+    let decode_ms = m.total_decode_time_ms.load(Ordering::Relaxed);
+    let tok_per_sec = if decode_ms > 0 {
+        (comp_tok as f64) / (decode_ms as f64 / 1000.0)
+    } else {
+        0.0
+    };
+    let uptime = m.start_time.elapsed().as_secs();
+
+    let out = format!(
+        "# HELP yesman_uptime_seconds Server uptime in seconds.\n\
+         # TYPE yesman_uptime_seconds gauge\n\
+         yesman_uptime_seconds {uptime}\n\
+         # HELP yesman_requests_total Total number of completion requests.\n\
+         # TYPE yesman_requests_total counter\n\
+         yesman_requests_total{{type=\"chat\"}} {chat_req}\n\
+         yesman_requests_total{{type=\"text\"}} {text_req}\n\
+         # HELP yesman_active_requests Currently executing requests.\n\
+         # TYPE yesman_active_requests gauge\n\
+         yesman_active_requests {active}\n\
+         # HELP yesman_tokens_prompt_total Total prompt tokens processed.\n\
+         # TYPE yesman_tokens_prompt_total counter\n\
+         yesman_tokens_prompt_total {prompt_tok}\n\
+         # HELP yesman_tokens_generated_total Total tokens generated.\n\
+         # TYPE yesman_tokens_generated_total counter\n\
+         yesman_tokens_generated_total {comp_tok}\n\
+         # HELP yesman_decode_tokens_per_second Mean generation speed across all requests.\n\
+         # TYPE yesman_decode_tokens_per_second gauge\n\
+         yesman_decode_tokens_per_second {tok_per_sec:.2}\n"
+    );
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        out,
+    )
+}
+
+async fn stats_handler(State(state): State<AppState>) -> Json<Value> {
+    let m = &state.0.metrics;
+    let chat_req = m.chat_requests.load(Ordering::Relaxed);
+    let text_req = m.text_requests.load(Ordering::Relaxed);
+    let active = m.active_requests.load(Ordering::Relaxed);
+    let prompt_tok = m.prompt_tokens.load(Ordering::Relaxed);
+    let comp_tok = m.completion_tokens.load(Ordering::Relaxed);
+    let decode_ms = m.total_decode_time_ms.load(Ordering::Relaxed);
+    let tok_per_sec = if decode_ms > 0 {
+        (comp_tok as f64) / (decode_ms as f64 / 1000.0)
+    } else {
+        0.0
+    };
+    Json(json!({
+        "uptime_secs": m.start_time.elapsed().as_secs(),
+        "model_id": state.0.model_id,
+        "dtype": state.0.dtype_name,
+        "ctx": state.0.ctx,
+        "max_concurrency": state.0.pool.max_sessions,
+        "active_requests": active,
+        "total_requests": chat_req + text_req,
+        "chat_requests": chat_req,
+        "text_requests": text_req,
+        "prompt_tokens": prompt_tok,
+        "completion_tokens": comp_tok,
+        "avg_decode_tok_per_sec": (tok_per_sec * 100.0).round() / 100.0,
+    }))
+}
+
 fn error_response(e: anyhow::Error) -> impl IntoResponse {
     (
         StatusCode::BAD_REQUEST,
@@ -269,7 +603,22 @@ async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatRequest>,
 ) -> Result<impl IntoResponse, impl IntoResponse> {
-    let plan = match state.plan(&req) {
+    let plan = match state.plan_chat(&req) {
+        Ok(p) => p,
+        Err(e) => return Err(error_response(e)),
+    };
+    if !req.stream {
+        Ok(non_stream_response(state, plan).await.into_response())
+    } else {
+        Ok(stream_response(state, plan).await.into_response())
+    }
+}
+
+async fn text_completions(
+    State(state): State<AppState>,
+    Json(req): Json<CompletionRequest>,
+) -> Result<impl IntoResponse, impl IntoResponse> {
+    let plan = match state.plan_completion(&req) {
         Ok(p) => p,
         Err(e) => return Err(error_response(e)),
     };
@@ -287,41 +636,89 @@ async fn non_stream_response(state: AppState, plan: RequestPlan) -> impl IntoRes
         sampler,
         id,
         model_id,
+        is_chat,
     } = plan;
     let prompt_len = prompt_ids.len();
+
+    let (session, permit) = match state.0.pool.acquire().await {
+        Ok(pair) => pair,
+        Err(e) => return error_response(e).into_response(),
+    };
+    state
+        .0
+        .metrics
+        .active_requests
+        .fetch_add(1, Ordering::Relaxed);
+    let worker_state = state.clone();
+
     let result = tokio::task::spawn_blocking(move || {
-        let mut model = state.0.model.lock().unwrap();
+        let t_start = Instant::now();
+        let mut session = session;
         let mut sampler = sampler;
         let res: Result<(Vec<u32>, String)> = generate(
-            &mut model,
-            &state.0.tok,
+            &mut session,
+            &worker_state.0.tok,
             &prompt_ids,
             &opts,
             &mut sampler,
             |_| Ok(()),
         );
-        res.map(|(ids, text)| (ids.len(), text))
+        let duration_ms = t_start.elapsed().as_millis() as u64;
+        worker_state.0.pool.release(session, permit);
+        res.map(|(ids, text)| (ids.len(), text, duration_ms))
     })
     .await;
 
+    state
+        .0
+        .metrics
+        .active_requests
+        .fetch_sub(1, Ordering::Relaxed);
+
     match result {
-        Ok(Ok((completion_tokens, text))) => Json(json!({
-            "id": id,
-            "object": "chat.completion",
-            "created": now_secs(),
-            "model": model_id,
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop",
-            }],
-            "usage": {
-                "prompt_tokens": prompt_len,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_len + completion_tokens,
+        Ok(Ok((completion_tokens, text, duration_ms))) => {
+            state
+                .0
+                .metrics
+                .record_completion(prompt_len, completion_tokens, duration_ms, is_chat);
+            if is_chat {
+                Json(json!({
+                    "id": id,
+                    "object": "chat.completion",
+                    "created": now_secs(),
+                    "model": model_id,
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": text},
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {
+                        "prompt_tokens": prompt_len,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": prompt_len + completion_tokens,
+                    }
+                }))
+                .into_response()
+            } else {
+                Json(json!({
+                    "id": id,
+                    "object": "text_completion",
+                    "created": now_secs(),
+                    "model": model_id,
+                    "choices": [{
+                        "text": text,
+                        "index": 0,
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {
+                        "prompt_tokens": prompt_len,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": prompt_len + completion_tokens,
+                    }
+                }))
+                .into_response()
             }
-        }))
-        .into_response(),
+        }
         Ok(Err(e)) => error_response(e).into_response(),
         Err(e) => error_response(anyhow!("worker panicked: {e}")).into_response(),
     }
@@ -331,48 +728,58 @@ async fn stream_response(state: AppState, plan: RequestPlan) -> impl IntoRespons
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
     let id = plan.id.clone();
     let model_id = plan.model_id.clone();
+    let is_chat = plan.is_chat;
+    let prompt_len = plan.prompt_ids.len();
     let created = now_secs();
 
+    let (session, permit) = match state.0.pool.acquire().await {
+        Ok(pair) => pair,
+        Err(e) => return error_response(e).into_response(),
+    };
+    state
+        .0
+        .metrics
+        .active_requests
+        .fetch_add(1, Ordering::Relaxed);
     let worker_state = state.clone();
+
     tokio::task::spawn_blocking(move || {
-        let mut model = worker_state.0.model.lock().unwrap();
+        let t_start = Instant::now();
+        let mut session = session;
         let mut sampler = plan.sampler;
+        let mut count = 0usize;
         let res: Result<(Vec<u32>, String)> = generate(
-            &mut model,
+            &mut session,
             &worker_state.0.tok,
             &plan.prompt_ids,
             &plan.opts,
             &mut sampler,
             |piece| {
+                count += 1;
                 let _ = tx.blocking_send(piece.to_string());
                 Ok(())
             },
         );
+        let duration_ms = t_start.elapsed().as_millis() as u64;
+        worker_state
+            .0
+            .metrics
+            .record_completion(prompt_len, count, duration_ms, is_chat);
+        worker_state
+            .0
+            .metrics
+            .active_requests
+            .fetch_sub(1, Ordering::Relaxed);
+        worker_state.0.pool.release(session, permit);
+
         if let Err(e) = res {
             let _ = tx.blocking_send(format!("\u{0}ERROR:{e}"));
         }
     });
 
     let stream = async_stream::stream! {
-        yield Ok::<Event, Infallible>(
-            Event::default().data(
-                json!({
-                    "id": id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model_id,
-                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": Value::Null}],
-                })
-                .to_string()
-            )
-        );
-        while let Some(piece) = rx.recv().await {
-            if let Some(msg) = piece.strip_prefix("\u{0}ERROR:") {
-                yield Ok::<Event, Infallible>(Event::default().data(
-                    json!({"error": {"message": msg}}).to_string()
-                ));
-                break;
-            }
+        let mut token_count = 0usize;
+        if is_chat {
             yield Ok::<Event, Infallible>(
                 Event::default().data(
                     json!({
@@ -380,26 +787,172 @@ async fn stream_response(state: AppState, plan: RequestPlan) -> impl IntoRespons
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": model_id,
-                        "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": Value::Null}],
+                        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": Value::Null}],
                     })
                     .to_string()
                 )
             );
         }
-        yield Ok::<Event, Infallible>(
-            Event::default().data(
-                json!({
-                    "id": id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model_id,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                })
-                .to_string()
-            )
-        );
+        while let Some(piece) = rx.recv().await {
+            if let Some(msg) = piece.strip_prefix("\u{0}ERROR:") {
+                yield Ok::<Event, Infallible>(Event::default().data(
+                    json!({"error": {"message": msg}}).to_string()
+                ));
+                break;
+            }
+            token_count += 1;
+            if is_chat {
+                yield Ok::<Event, Infallible>(
+                    Event::default().data(
+                        json!({
+                            "id": id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_id,
+                            "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": Value::Null}],
+                        })
+                        .to_string()
+                    )
+                );
+            } else {
+                yield Ok::<Event, Infallible>(
+                    Event::default().data(
+                        json!({
+                            "id": id,
+                            "object": "text_completion",
+                            "created": created,
+                            "model": model_id,
+                            "choices": [{"text": piece, "index": 0, "finish_reason": Value::Null}],
+                        })
+                        .to_string()
+                    )
+                );
+            }
+        }
+
+        if is_chat {
+            yield Ok::<Event, Infallible>(
+                Event::default().data(
+                    json!({
+                        "id": id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_id,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        "usage": {
+                            "prompt_tokens": prompt_len,
+                            "completion_tokens": token_count,
+                            "total_tokens": prompt_len + token_count,
+                        }
+                    })
+                    .to_string()
+                )
+            );
+        } else {
+            yield Ok::<Event, Infallible>(
+                Event::default().data(
+                    json!({
+                        "id": id,
+                        "object": "text_completion",
+                        "created": created,
+                        "model": model_id,
+                        "choices": [{"text": "", "index": 0, "finish_reason": "stop"}],
+                        "usage": {
+                            "prompt_tokens": prompt_len,
+                            "completion_tokens": token_count,
+                            "total_tokens": prompt_len + token_count,
+                        }
+                    })
+                    .to_string()
+                )
+            );
+        }
         yield Ok::<Event, Infallible>(Event::default().data("[DONE]"));
     };
 
-    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+    Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_text_parsing() {
+        let msg_str = Message {
+            role: "user".into(),
+            content: Value::String("hello world".into()),
+        };
+        assert_eq!(msg_str.text(), "hello world");
+
+        let msg_arr = Message {
+            role: "user".into(),
+            content: json!([
+                {"type": "text", "text": "part 1"},
+                {"type": "text", "text": "part 2"}
+            ]),
+        };
+        assert_eq!(msg_arr.text(), "part 1\npart 2");
+    }
+
+    #[test]
+    fn build_messages_injects_system() {
+        let msgs = vec![Message {
+            role: "user".into(),
+            content: Value::String("hi".into()),
+        }];
+        let built = build_messages(&msgs);
+        assert_eq!(built.len(), 2);
+        assert_eq!(built[0].role, "system");
+        assert_eq!(built[1].role, "user");
+        assert_eq!(built[1].content, "hi");
+
+        // When system is already present, do not duplicate
+        let msgs_with_sys = vec![
+            Message {
+                role: "system".into(),
+                content: Value::String("custom system".into()),
+            },
+            Message {
+                role: "user".into(),
+                content: Value::String("hi".into()),
+            },
+        ];
+        let built2 = build_messages(&msgs_with_sys);
+        assert_eq!(built2.len(), 2);
+        assert_eq!(built2[0].content, "custom system");
+    }
+
+    #[test]
+    fn completion_request_prompt_string() {
+        let req_str = CompletionRequest {
+            model: None,
+            prompt: Value::String("once upon a time".into()),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            max_tokens: None,
+            repetition_penalty: None,
+            seed: None,
+            stream: false,
+            stop: None,
+        };
+        assert_eq!(req_str.prompt_str(), "once upon a time");
+
+        let req_arr = CompletionRequest {
+            model: None,
+            prompt: json!(["once ", "upon ", "a time"]),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            max_tokens: None,
+            repetition_penalty: None,
+            seed: None,
+            stream: false,
+            stop: None,
+        };
+        assert_eq!(req_arr.prompt_str(), "once upon a time");
+    }
 }

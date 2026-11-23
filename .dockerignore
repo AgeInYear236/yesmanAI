@@ -1,0 +1,6 @@
+target/
+models/
+data/
+*.ymq
+.git/
+.github/

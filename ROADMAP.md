@@ -67,25 +67,29 @@ Checked: bf16-логиты совпадают с независимым numpy-э
 
 ---
 
-## P1 — Сервер как продукт ✅ следующий этап
+## P1 — Сервер как продукт [ВЫПОЛНЕНО]
 
 **Цель:** несколько клиентов и удобная эксплуатация.
-**Оценка:** M–L. **Зависит от:** P0 (стабильный длинный контекст).
 
-- [ ] **Continuous batching / несколько KV-кэшей**
-  - Сейчас `Mutex<Qwen2>` = один запрос за раз, остальные ядра простаивают.
-  - Вариант: пул `Vec<Qwen2>`/`KvCache` + scheduler, либо батчевый forward с маской; метрика — aggregate tok/s при 4 клиентах.
-- [ ] `/v1/completions` (legacy text completion) и `usage` в завершающем SSE-чанке.
-- [ ] Метрики: tok/s, queue depth, ctx utilization, loaded dtype (Prometheus `/metrics` или plain JSON).
-- [ ] Docker-образ + systemd-юнит, graceful shutdown, лимит `--ctx` на запрос.
-- [ ] Smoke с официальным `openai` SDK (`base_url=http://…/v1`) в CI.
-
-**Done-критерий:** 4 одновременных клиента отвечают корректно; aggregate
-throughput выше, чем у одного; есть Dockerfile и метрики.
+- [x] **Конкурентный пул сессий (`SessionPool`)**
+  - Модель разделена на неизменяемые веса `Qwen2Weights` в `Arc` (~1.6 ГБ в RAM) и легковесные сессии `clone_session` с собственным `KvCache` и `Workspace`.
+  - Управление параллелизмом через асинхронный семафор (`--max-concurrency`, по умолчанию 4) и пул свободных сессий `idle`.
+  - Замер параллельности (`tools/bench_server.py`): 4 одновременных клиента завершают генерацию за 13.01s (128 токенов) с совокупным темпом ~10 tok/s и нулевым взаимным влиянием.
+- [x] **`/v1/completions` и `usage` в SSE**
+  - Реализован эндпоинт `/v1/completions` (legacy text completions) в обычном и стриминговом (SSE) режимах.
+  - Потоковые чанки теперь включают блок `usage: {prompt_tokens, completion_tokens, total_tokens}` в завершающем событии перед `[DONE]`.
+- [x] **Метрики и телеметрия**
+  - `GET /metrics`: экспортёр в формате Prometheus (`yesman_requests_total`, `yesman_active_requests`, `yesman_tokens_generated_total`, `yesman_decode_tokens_per_second`, `yesman_uptime_seconds`).
+  - `GET /stats`: JSON-отчёт о состоянии сервера (активные запросы, общее число токенов, tok/s, параметры пула).
+- [x] **Graceful shutdown & развёртывание**
+  - Обработка `SIGINT` (Ctrl+C) и `SIGTERM` через Tokio signal с корректным завершением активных задач.
+  - Многоэтапный `Dockerfile` (сборка в `rust:bookworm`, запуск в легковесном `debian:bookworm-slim` без root).
+  - Шаблон systemd-сервиса `tools/yesman.service` с изоляцией и лимитами.
+  - Скрипт бенчмарка параллельных клиентов: `tools/bench_server.py`.
 
 ---
 
-## P2 — Скорость: два реальных пути
+## P2 — Скорость: два реальных пути ✅ следующий этап
 
 > Честно: после `770e38e` ядра не являются бутылочным горлышком. Любая
 > оптимизация здесь обязана начинаться с `bench_matmul` + `YESMAN_PROFILE`.

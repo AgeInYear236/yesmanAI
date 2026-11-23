@@ -4,7 +4,7 @@
 //! row-major, attention has q/k/v biases, RoPE is the HF "rotate half" variant
 //! with theta = 1e6, and `lm_head` is tied to `embed_tokens`.
 
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 use anyhow::{Context, Result, anyhow, bail};
 use rayon::prelude::*;
@@ -62,7 +62,7 @@ impl DType {
 }
 
 /// A weight matrix: f32, bf16, Q8_0 or Q4_0. Also the (tied) embedding.
-enum Weight {
+pub(crate) enum Weight {
     F32(Tensor),
     BF16(Bf16Tensor),
     Q8(Q8Tensor),
@@ -144,7 +144,7 @@ fn f32_bytes(x: &[f32]) -> Vec<u8> {
     out
 }
 
-struct Layer {
+pub(crate) struct Layer {
     in_norm: Vec<f32>,
     post_norm: Vec<f32>,
     wq: Weight,
@@ -225,13 +225,24 @@ impl Workspace {
     }
 }
 
+pub struct Qwen2Weights {
+    pub(crate) cfg: Config,
+    pub(crate) embed: Weight,
+    pub(crate) final_norm: Vec<f32>,
+    pub(crate) layers: Vec<Layer>,
+    pub(crate) cos: Vec<f32>,
+    pub(crate) sin: Vec<f32>,
+}
+
+impl Qwen2Weights {
+    pub fn cfg(&self) -> &Config {
+        &self.cfg
+    }
+}
+
 pub struct Qwen2 {
     pub cfg: Config,
-    embed: Weight,
-    final_norm: Vec<f32>,
-    layers: Vec<Layer>,
-    cos: Vec<f32>,
-    sin: Vec<f32>,
+    pub weights: Arc<Qwen2Weights>,
     kv: KvCache,
     ws: Workspace,
 }
@@ -292,17 +303,21 @@ impl Qwen2 {
             });
         }
 
-        let (cos, sin) = ops::rope_tables(max_ctx, cfg.head_dim(), cfg.rope_theta);
+        let rope_len = max_ctx.max(cfg.max_position_embeddings);
+        let (cos, sin) = ops::rope_tables(rope_len, cfg.head_dim(), cfg.rope_theta);
         let kv = KvCache::new(cfg.num_hidden_layers, max_ctx, cfg.kv_dim());
-
         let ws = Workspace::new(&cfg);
-        Ok(Self {
-            cfg,
+        let weights = Arc::new(Qwen2Weights {
+            cfg: cfg.clone(),
             embed,
             final_norm,
             layers,
             cos,
             sin,
+        });
+        Ok(Self {
+            cfg,
+            weights,
             kv,
             ws,
         })
@@ -347,16 +362,21 @@ impl Qwen2 {
             });
         }
 
-        let (cos, sin) = ops::rope_tables(max_ctx, cfg.head_dim(), cfg.rope_theta);
+        let rope_len = max_ctx.max(cfg.max_position_embeddings);
+        let (cos, sin) = ops::rope_tables(rope_len, cfg.head_dim(), cfg.rope_theta);
         let kv = KvCache::new(cfg.num_hidden_layers, max_ctx, cfg.kv_dim());
         let ws = Workspace::new(&cfg);
-        Ok(Self {
-            cfg,
+        let weights = Arc::new(Qwen2Weights {
+            cfg: cfg.clone(),
             embed,
             final_norm,
             layers,
             cos,
             sin,
+        });
+        Ok(Self {
+            cfg,
+            weights,
             kv,
             ws,
         })
@@ -412,15 +432,19 @@ impl Qwen2 {
         let mut small: Vec<Vec<u8>> = Vec::new();
         let mut specs: Vec<Spec<'_>> = Vec::new();
 
-        push_weight(&mut specs, "model.embed_tokens.weight".into(), &self.embed)?;
+        push_weight(
+            &mut specs,
+            "model.embed_tokens.weight".into(),
+            &self.weights.embed,
+        )?;
         push_small(
             &mut specs,
             &mut small,
             "model.norm.weight".into(),
-            &self.final_norm,
+            &self.weights.final_norm,
         );
 
-        for (i, l) in self.layers.iter().enumerate() {
+        for (i, l) in self.weights.layers.iter().enumerate() {
             let p = format!("model.layers.{i}");
             for (name, data) in [
                 ("input_layernorm.weight", &l.in_norm),
@@ -476,6 +500,19 @@ impl Qwen2 {
         self.kv.clear();
     }
 
+    /// Create a new independent session sharing the exact same model weights via `Arc`.
+    ///
+    /// The new session has its own KV cache (sized to `max_ctx`) and scratchpad,
+    /// so multiple sessions can run in parallel without memory duplication.
+    pub fn clone_session(&self, max_ctx: usize) -> Self {
+        Self {
+            cfg: self.cfg.clone(),
+            weights: Arc::clone(&self.weights),
+            kv: KvCache::new(self.cfg.num_hidden_layers, max_ctx, self.cfg.kv_dim()),
+            ws: Workspace::new(&self.cfg),
+        }
+    }
+
     /// Run a slice of tokens of length up to `PREFILL_CHUNK` through the transformer layers,
     /// storing K/V in the cache and leaving the final hidden states in `ws.x`.
     fn forward_layers(&mut self, tokens: &[u32], pos0: usize) {
@@ -507,11 +544,11 @@ impl Qwen2 {
         // read-only during a forward pass (except the KV cache, reborrowed
         // below for each layer's writes).
         let ws = &mut self.ws;
-        let layers = &self.layers;
+        let layers = &self.weights.layers;
         let kv = &mut self.kv;
-        let cos = &self.cos;
-        let sin = &self.sin;
-        let embed = &self.embed;
+        let cos = &self.weights.cos;
+        let sin = &self.weights.sin;
+        let embed = &self.weights.embed;
 
         let t_max = pos0 + m;
         ws.ensure(m, h, inter, kv_dim);
@@ -661,9 +698,14 @@ impl Qwen2 {
         let vocab = self.cfg.vocab_size;
         let eps = self.cfg.rms_norm_eps;
         let xf = &mut self.ws.xf[..h];
-        ops::rmsnorm(xf, &self.ws.x[(m - 1) * h..m * h], &self.final_norm, eps);
+        ops::rmsnorm(
+            xf,
+            &self.ws.x[(m - 1) * h..m * h],
+            &self.weights.final_norm,
+            eps,
+        );
         let logits = &mut self.ws.logits[..vocab];
-        self.embed.matmul(logits, xf, 1, h, vocab);
+        self.weights.embed.matmul(logits, xf, 1, h, vocab);
         logits.to_vec()
     }
 
@@ -725,9 +767,14 @@ impl Qwen2 {
                 if global_idx + 1 < n {
                     let target = tokens[global_idx + 1] as usize;
                     let xf = &mut self.ws.xf[..h];
-                    ops::rmsnorm(xf, &self.ws.x[j * h..(j + 1) * h], &self.final_norm, eps);
+                    ops::rmsnorm(
+                        xf,
+                        &self.ws.x[j * h..(j + 1) * h],
+                        &self.weights.final_norm,
+                        eps,
+                    );
                     let logits = &mut self.ws.logits[..vocab];
-                    self.embed.matmul(logits, xf, 1, h, vocab);
+                    self.weights.embed.matmul(logits, xf, 1, h, vocab);
 
                     let mut max_logit = f32::NEG_INFINITY;
                     for &v in logits.iter() {

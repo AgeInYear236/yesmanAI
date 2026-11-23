@@ -1,0 +1,21 @@
+[Unit]
+Description=yesmanAI OpenAI-compatible Inference Server
+After=network.target
+
+[Service]
+Type=simple
+User=yesman
+Group=yesman
+WorkingDirectory=/opt/yesman
+ExecStart=/usr/local/bin/yesman-server --cache /opt/yesman/models/Qwen2.5-1.5B-Instruct/model.q4km.ymq --host 0.0.0.0 --port 8000 --max-concurrency 4
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+# Sandboxing
+ProtectSystem=full
+ProtectHome=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

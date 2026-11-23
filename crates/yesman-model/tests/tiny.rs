@@ -235,3 +235,36 @@ fn compute_nll_and_perplexity() {
     let too_long: Vec<u32> = (0..100).map(|i| (i % 20) as u32).collect();
     assert!(m.compute_nll(&too_long).is_err());
 }
+
+/// Cloned sessions share weights via Arc, have independent KV caches,
+/// and can decode concurrently without crosstalk.
+#[test]
+fn cloned_sessions_run_independently() {
+    let (ids, want) = fixture();
+    let root = model();
+
+    let mut s1 = root.clone_session(64);
+    let mut s2 = root.clone_session(64);
+
+    // s1 and s2 forward different prefixes
+    let _g1 = s1.forward(&ids[..3], 0);
+    assert_eq!(s1.kv_len(), 3);
+    assert_eq!(s2.kv_len(), 0);
+
+    let g2 = s2.forward(&ids, 0);
+    assert_eq!(s2.kv_len(), ids.len());
+    assert_eq!(s1.kv_len(), 3);
+
+    for (i, (w, g)) in want.iter().zip(g2.iter()).enumerate() {
+        let tol = 1e-4 + 1e-5 * w.abs();
+        assert!((w - g).abs() < tol, "s2 logit {i}: {w} vs {g}");
+    }
+
+    // Now resume s1
+    let g1_rest = s1.forward(&ids[3..], 3);
+    assert_eq!(s1.kv_len(), ids.len());
+    for (i, (w, g)) in want.iter().zip(g1_rest.iter()).enumerate() {
+        let tol = 1e-4 + 1e-5 * w.abs();
+        assert!((w - g).abs() < tol, "s1 logit {i}: {w} vs {g}");
+    }
+}
