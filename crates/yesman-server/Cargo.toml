@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 yesman-model.workspace = true
+yesman-cuda.workspace = true
 anyhow.workspace = true
 async-stream.workspace = true
 axum.workspace = true

@@ -62,7 +62,7 @@ impl DType {
 }
 
 /// A weight matrix: f32, bf16, Q8_0 or Q4_0. Also the (tied) embedding.
-pub(crate) enum Weight {
+pub enum Weight {
     F32(Tensor),
     BF16(Bf16Tensor),
     Q8(Q8Tensor),
@@ -82,7 +82,7 @@ impl Weight {
     }
 
     /// `out[m,n] = x[m,k] @ self[n,k]^T`
-    fn matmul(&self, out: &mut [f32], x: &[f32], m: usize, k: usize, n: usize) {
+    pub fn matmul(&self, out: &mut [f32], x: &[f32], m: usize, k: usize, n: usize) {
         match self {
             Weight::F32(t) => ops::matmul(out, x, &t.data, m, k, n),
             Weight::BF16(t) => bf16::matmul(out, x, t, m, k, n),
@@ -101,7 +101,7 @@ impl Weight {
         }
     }
 
-    fn gather(&self, row: usize) -> Vec<f32> {
+    pub(crate) fn gather(&self, row: usize) -> Vec<f32> {
         match self {
             Weight::F32(t) => t.row(row).to_vec(),
             Weight::BF16(t) => t.dequant_row(row),
@@ -144,19 +144,19 @@ fn f32_bytes(x: &[f32]) -> Vec<u8> {
     out
 }
 
-pub(crate) struct Layer {
-    in_norm: Vec<f32>,
-    post_norm: Vec<f32>,
-    wq: Weight,
-    wk: Weight,
-    wv: Weight,
-    wo: Weight,
-    bq: Vec<f32>,
-    bk: Vec<f32>,
-    bv: Vec<f32>,
-    w_gate: Weight,
-    w_up: Weight,
-    w_down: Weight,
+pub struct Layer {
+    pub in_norm: Vec<f32>,
+    pub post_norm: Vec<f32>,
+    pub wq: Weight,
+    pub wk: Weight,
+    pub wv: Weight,
+    pub wo: Weight,
+    pub bq: Vec<f32>,
+    pub bk: Vec<f32>,
+    pub bv: Vec<f32>,
+    pub w_gate: Weight,
+    pub w_up: Weight,
+    pub w_down: Weight,
 }
 
 /// Scratch buffers reused across layers and across decode steps. Without this
@@ -226,12 +226,12 @@ impl Workspace {
 }
 
 pub struct Qwen2Weights {
-    pub(crate) cfg: Config,
-    pub(crate) embed: Weight,
-    pub(crate) final_norm: Vec<f32>,
-    pub(crate) layers: Vec<Layer>,
-    pub(crate) cos: Vec<f32>,
-    pub(crate) sin: Vec<f32>,
+    pub cfg: Config,
+    pub embed: Weight,
+    pub final_norm: Vec<f32>,
+    pub layers: Vec<Layer>,
+    pub cos: Vec<f32>,
+    pub sin: Vec<f32>,
 }
 
 impl Qwen2Weights {
@@ -486,6 +486,10 @@ impl Qwen2 {
             })
             .collect();
         cache::write_cache(path, &entries)
+    }
+
+    pub fn gather_embed(&self, row: usize) -> Vec<f32> {
+        self.weights.embed.gather(row)
     }
 
     pub fn kv_len(&self) -> usize {

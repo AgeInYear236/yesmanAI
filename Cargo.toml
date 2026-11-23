@@ -10,6 +10,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 yesman-core = { path = "crates/yesman-core" }
 yesman-model = { path = "crates/yesman-model" }
+yesman-cuda = { path = "crates/yesman-cuda" }
 
 anyhow = "1"
 async-stream = "0.3"

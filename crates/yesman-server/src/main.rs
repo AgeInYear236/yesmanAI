@@ -29,6 +29,7 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tower_http::cors::CorsLayer;
+use yesman_cuda::{CudaDevice, CudaQwen2, CudaQwen2Weights, is_cuda_available};
 use yesman_model::{
     Config, DType, GenerateOptions, GenerationConfig, Qwen2, Sampler, Tokenizer, chat, generate,
 };
@@ -41,6 +42,9 @@ struct Args {
     /// f32 | bf16 | q8 | q4 | q4k (all 4-bit) | q4km (FFN in Q8, best quality)
     #[arg(long, default_value = "bf16")]
     dtype: String,
+    /// Execution backend: auto | cpu | cuda
+    #[arg(long, default_value = "auto")]
+    device: String,
     /// Context window size per session
     #[arg(long, default_value_t = 4096)]
     ctx: usize,
@@ -59,41 +63,85 @@ struct Args {
     cache: Option<PathBuf>,
 }
 
-/// Pool of reusable Qwen2 sessions sharing immutable model weights via `Arc`.
+enum ServerSession {
+    Cpu(Qwen2),
+    Gpu(Box<CudaQwen2>, Qwen2),
+}
+
+impl ServerSession {
+    fn generate(
+        &mut self,
+        tok: &Tokenizer,
+        prompt_ids: &[u32],
+        opts: &GenerateOptions,
+        sampler: &mut Sampler,
+        on_token: impl FnMut(&str) -> Result<()>,
+    ) -> Result<(Vec<u32>, String)> {
+        match self {
+            Self::Cpu(m) => generate(m, tok, prompt_ids, opts, sampler, on_token),
+            Self::Gpu(g, cpu) => g.generate(tok, cpu, prompt_ids, opts, sampler, on_token),
+        }
+    }
+
+    fn reset(&mut self) {
+        match self {
+            Self::Cpu(m) => m.reset(),
+            Self::Gpu(g, _) => g.reset(),
+        }
+    }
+}
+
+enum PoolBackend {
+    Cpu,
+    Gpu(Arc<CudaQwen2Weights>),
+}
+
+/// Pool of reusable model sessions sharing immutable model weights via `Arc`.
 struct SessionPool {
     root: Qwen2,
     ctx: usize,
-    idle: Mutex<Vec<Qwen2>>,
+    backend: PoolBackend,
+    idle: Mutex<Vec<ServerSession>>,
     sem: Arc<tokio::sync::Semaphore>,
     max_sessions: usize,
 }
 
 impl SessionPool {
-    fn new(root: Qwen2, ctx: usize, max_sessions: usize) -> Self {
+    fn new(root: Qwen2, ctx: usize, max_sessions: usize, backend: PoolBackend) -> Self {
         let max_sessions = max_sessions.max(1);
         Self {
             root,
             ctx,
+            backend,
             idle: Mutex::new(Vec::new()),
             sem: Arc::new(tokio::sync::Semaphore::new(max_sessions)),
             max_sessions,
         }
     }
 
-    async fn acquire(&self) -> Result<(Qwen2, tokio::sync::OwnedSemaphorePermit)> {
+    async fn acquire(&self) -> Result<(ServerSession, tokio::sync::OwnedSemaphorePermit)> {
         let permit = Arc::clone(&self.sem)
             .acquire_owned()
             .await
             .map_err(|e| anyhow!("semaphore closed: {e}"))?;
         let session = {
             let mut idle = self.idle.lock().unwrap();
-            idle.pop()
-                .unwrap_or_else(|| self.root.clone_session(self.ctx))
+            if let Some(s) = idle.pop() {
+                s
+            } else {
+                match &self.backend {
+                    PoolBackend::Cpu => ServerSession::Cpu(self.root.clone_session(self.ctx)),
+                    PoolBackend::Gpu(weights) => {
+                        let gpu = weights.create_session(self.ctx)?;
+                        ServerSession::Gpu(Box::new(gpu), self.root.clone_session(self.ctx))
+                    }
+                }
+            }
         };
         Ok((session, permit))
     }
 
-    fn release(&self, mut session: Qwen2, permit: tokio::sync::OwnedSemaphorePermit) {
+    fn release(&self, mut session: ServerSession, permit: tokio::sync::OwnedSemaphorePermit) {
         session.reset();
         {
             let mut idle = self.idle.lock().unwrap();
@@ -155,6 +203,7 @@ struct Inner {
     generation: GenerationConfig,
     model_id: String,
     dtype_name: String,
+    backend_name: String,
     ctx: usize,
     seq: AtomicU64,
     metrics: ServerMetrics,
@@ -439,7 +488,34 @@ async fn main() -> Result<()> {
         t0.elapsed().as_secs_f32()
     );
 
-    let pool = SessionPool::new(root_model, args.ctx, args.max_concurrency);
+    let use_cuda = match args.device.to_lowercase().as_str() {
+        "cuda" | "gpu" => {
+            if !is_cuda_available() {
+                anyhow::bail!("CUDA is not available on this machine (driver not found)");
+            }
+            true
+        }
+        "cpu" => false,
+        "auto" => is_cuda_available(),
+        other => anyhow::bail!("unknown device `{other}` (auto|cpu|cuda)"),
+    };
+
+    let (backend, backend_name) = if use_cuda {
+        let dev = CudaDevice::new(0)?;
+        let ctx = dev.create_context()?;
+        eprintln!(
+            "using GPU backend: {} ({:.2} GB VRAM)",
+            dev.name,
+            dev.total_memory as f64 / (1024.0 * 1024.0 * 1024.0)
+        );
+        let weights = CudaQwen2Weights::from_cpu(&root_model, ctx)?;
+        (PoolBackend::Gpu(weights), format!("cuda ({})", dev.name))
+    } else {
+        eprintln!("using CPU backend (AVX2/FMA)");
+        (PoolBackend::Cpu, "cpu".to_string())
+    };
+
+    let pool = SessionPool::new(root_model, args.ctx, args.max_concurrency, backend);
     eprintln!(
         "initialized session pool: max_concurrency={}, ctx={}",
         args.max_concurrency, args.ctx
@@ -452,6 +528,7 @@ async fn main() -> Result<()> {
         generation,
         model_id: args.model_id,
         dtype_name,
+        backend_name,
         ctx: args.ctx,
         seq: AtomicU64::new(0),
         metrics: ServerMetrics::new(),
@@ -580,6 +657,7 @@ async fn stats_handler(State(state): State<AppState>) -> Json<Value> {
         "uptime_secs": m.start_time.elapsed().as_secs(),
         "model_id": state.0.model_id,
         "dtype": state.0.dtype_name,
+        "backend": state.0.backend_name,
         "ctx": state.0.ctx,
         "max_concurrency": state.0.pool.max_sessions,
         "active_requests": active,
@@ -655,8 +733,7 @@ async fn non_stream_response(state: AppState, plan: RequestPlan) -> impl IntoRes
         let t_start = Instant::now();
         let mut session = session;
         let mut sampler = sampler;
-        let res: Result<(Vec<u32>, String)> = generate(
-            &mut session,
+        let res: Result<(Vec<u32>, String)> = session.generate(
             &worker_state.0.tok,
             &prompt_ids,
             &opts,
@@ -748,8 +825,7 @@ async fn stream_response(state: AppState, plan: RequestPlan) -> impl IntoRespons
         let mut session = session;
         let mut sampler = plan.sampler;
         let mut count = 0usize;
-        let res: Result<(Vec<u32>, String)> = generate(
-            &mut session,
+        let res: Result<(Vec<u32>, String)> = session.generate(
             &worker_state.0.tok,
             &plan.prompt_ids,
             &plan.opts,

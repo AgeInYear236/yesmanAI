@@ -24,14 +24,18 @@ No ML frameworks: no torch, no candle, no burn, no BLAS. Only `safetensors`
 | Q4_K super-blocks: `q4k` (Q4_K_S-like) and `q4km` (mixed, Q4_K_M-like) | done |
 | Persistent quant cache (startup ~0.3-2 s instead of ~6 s) | done |
 | OpenAI-compatible HTTP API + SSE streaming | done |
-| CUDA backend | dropped by user request (also blocked: no nvcc/NVRTC/cuBLAS) |
-| Q4_K RMSE-optimized scale search / Q6_K | optional future work |
+| Chunked prefill (8k–32k context without OOM) | done |
+| Perplexity evaluation across all formats (WikiText-2) | done |
+| CUDA backend (zero-dependency, dynamic libcuda.so.1 driver API) | done (~22 tok/s on RTX 3060) |
+| Multi-session concurrent pool | done |
 
 ## Layout
 
 ```
 crates/yesman-core     tensors, CPU kernels, safetensors reader, Q8/Q4_0/Q4_K, cache
   examples/diag_q4k.rs diagnostic: dequant RMSE of Q4_K vs Q4_0 on a fixture
+crates/yesman-cuda     zero-dependency CUDA driver API, PTX kernels, GPU execution
+  examples/bench_gpu.rs  standalone GPU benchmark
 crates/yesman-model    Qwen2 architecture, KV cache, tokenizer, sampling, chat
 crates/yesman-cli       `yesman` binary (one-shot or interactive chat)
 crates/yesman-server    `yesman-server` (OpenAI-compatible HTTP API)
@@ -166,11 +170,14 @@ decode on 20 cores:
 
 | weights | load from safetensors | load from cache | decode |
 | --- | --- | --- | --- |
-| bf16 | ~0.9 s | — | ~4 tok/s |
-| Q8_0 | ~5.8 s | ~2.0 s | ~11 tok/s |
-| Q4_0 | ~5.7 s | ~1.3 s | ~15 tok/s |
-| Q4_K (`q4k`) | ~5.4 s | ~1.3 s | ~16 tok/s |
-| Q4_K_M (`q4km`) | ~5.9 s | ~2.0 s | ~11 tok/s |
+| bf16 (CPU) | ~0.9 s | — | ~4 tok/s |
+| Q8_0 (CPU) | ~5.8 s | ~2.0 s | ~11 tok/s |
+| Q4_0 (CPU) | ~5.7 s | ~1.3 s | ~15 tok/s |
+| Q4_K (`q4k`, CPU) | ~5.4 s | ~1.3 s | ~16 tok/s |
+| Q4_K_M (`q4km`, CPU) | ~5.9 s | ~2.0 s | ~11 tok/s |
+| **Q4_K_M on RTX 3060 (GPU)** | — | **~1.1 s** *(VRAM upload 0.28s)* | **~22 tok/s** |
+
+Use `--device cuda` or `--device cpu` (default: `auto` selects CUDA if an NVIDIA GPU driver is available, otherwise CPU).
 
 Q4_0 weights are 4-bit with activations in Q8_0. It is noticeably lossier than
 Q8_0 on a 1.5B model — text stays coherent but top-8 logits shift.

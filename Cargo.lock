@@ -1503,6 +1503,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "yesman-cuda",
  "yesman-model",
 ]
 
@@ -1517,6 +1518,18 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "yesman-cuda"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "half",
+ "libc",
+ "serde_json",
+ "yesman-core",
+ "yesman-model",
 ]
 
 [[package]]
@@ -1544,6 +1557,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tower-http",
+ "yesman-cuda",
  "yesman-model",
 ]
 

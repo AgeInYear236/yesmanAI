@@ -1,11 +1,13 @@
 use std::{
     io::{self, BufRead, Write},
     path::PathBuf,
+    sync::Arc,
     time::Instant,
 };
 
 use anyhow::Result;
 use clap::Parser;
+use yesman_cuda::{CudaDevice, CudaQwen2, is_cuda_available};
 use yesman_model::{
     Config, DType, GenerateOptions, GenerationConfig, Qwen2, Sampler, Tokenizer, chat, chat_once,
 };
@@ -19,6 +21,10 @@ struct Args {
     /// Directory with config.json / tokenizer.json / model.safetensors
     #[arg(short, long, default_value = "models/Qwen2.5-1.5B-Instruct")]
     model: PathBuf,
+
+    /// Execution backend: auto | cpu | cuda
+    #[arg(long, default_value = "auto")]
+    device: String,
 
     /// Context window for the KV cache
     #[arg(long, default_value_t = 4096)]
@@ -181,13 +187,40 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
+    let use_cuda = match args.device.to_lowercase().as_str() {
+        "cuda" | "gpu" => {
+            if !is_cuda_available() {
+                anyhow::bail!("CUDA is not available on this machine (driver not found)");
+            }
+            true
+        }
+        "cpu" => false,
+        "auto" => is_cuda_available(),
+        other => anyhow::bail!("unknown device `{other}` (auto|cpu|cuda)"),
+    };
+
+    let mut engine = if use_cuda {
+        let dev = CudaDevice::new(0)?;
+        let ctx = dev.create_context()?;
+        eprintln!(
+            "using GPU backend: {} ({:.2} GB VRAM)",
+            dev.name,
+            dev.total_memory as f64 / (1024.0 * 1024.0 * 1024.0)
+        );
+        let gpu_model = CudaQwen2::from_cpu(&model, Arc::clone(&ctx), args.ctx)?;
+        Engine::Gpu(Box::new(gpu_model), model)
+    } else {
+        eprintln!("using CPU backend (AVX2/FMA)");
+        Engine::Cpu(model)
+    };
+
     if let Some(p) = &args.prompt {
         let messages = if args.raw {
             vec![chat::user(p.clone())]
         } else {
             vec![system_message(&args), chat::user(p.clone())]
         };
-        print_reply(&mut model, &tok, &cfg, &messages, &opts, &mut sampler)?;
+        print_reply(&mut engine, &tok, &cfg, &messages, &opts, &mut sampler)?;
         return Ok(());
     }
 
@@ -210,16 +243,45 @@ fn main() -> Result<()> {
         }
         if line == "/reset" || line == "/clear" {
             history = vec![system_message(&args)];
-            model.reset();
+            engine.reset();
             println!("История диалога и KV-кэш сброшены.\n");
             continue;
         }
         history.push(chat::user(line.to_string()));
-        let reply = print_reply(&mut model, &tok, &cfg, &history, &opts, &mut sampler)?;
+        let reply = print_reply(&mut engine, &tok, &cfg, &history, &opts, &mut sampler)?;
         history.push(chat::assistant(reply));
         println!();
     }
     Ok(())
+}
+
+enum Engine {
+    Cpu(Qwen2),
+    Gpu(Box<CudaQwen2>, Qwen2),
+}
+
+impl Engine {
+    fn reset(&mut self) {
+        match self {
+            Self::Cpu(m) => m.reset(),
+            Self::Gpu(g, _) => g.reset(),
+        }
+    }
+
+    fn chat_once(
+        &mut self,
+        tok: &Tokenizer,
+        cfg: &Config,
+        messages: &[chat::Message],
+        opts: &GenerateOptions,
+        sampler: &mut Sampler,
+        on_token: impl FnMut(&str) -> Result<()>,
+    ) -> Result<String> {
+        match self {
+            Self::Cpu(m) => chat_once(m, tok, cfg, messages, opts, sampler, on_token),
+            Self::Gpu(g, cpu) => g.chat_once(tok, cpu, cfg, messages, opts, sampler, on_token),
+        }
+    }
 }
 
 fn system_message(args: &Args) -> chat::Message {
@@ -240,7 +302,7 @@ fn prompt_text(args: &Args) -> String {
 }
 
 fn print_reply(
-    model: &mut Qwen2,
+    engine: &mut Engine,
     tok: &Tokenizer,
     cfg: &Config,
     messages: &[chat::Message],
@@ -250,7 +312,7 @@ fn print_reply(
     let t0 = Instant::now();
     let mut tokens = 0usize;
     let mut first_token_at = t0;
-    let text = chat_once(model, tok, cfg, messages, opts, sampler, |piece| {
+    let text = engine.chat_once(tok, cfg, messages, opts, sampler, |piece| {
         if tokens == 0 {
             first_token_at = Instant::now();
         }

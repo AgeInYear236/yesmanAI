@@ -1,0 +1,12 @@
+[package]
+name = "yesman-cuda"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+yesman-core.workspace = true
+yesman-model.workspace = true
+anyhow.workspace = true
+libc = "0.2"
+half.workspace = true
+serde_json.workspace = true
