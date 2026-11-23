@@ -29,8 +29,7 @@ pub fn assistant(content: impl Into<String>) -> Message {
     }
 }
 
-pub const DEFAULT_SYSTEM: &str =
-    "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
+pub const DEFAULT_SYSTEM: &str = "Ты — добрый, простой и отзывчивый помощник. Ты общаешься тепло, дружелюбно и живо, без заумных слов, скучного официоза и роботизированных фраз. Объясняй всё просто, понятно и по-человечески, как хороший друг.";
 
 /// Render a conversation and leave the prompt open at `<|im_start|>assistant`.
 pub fn render(messages: &[Message]) -> String {

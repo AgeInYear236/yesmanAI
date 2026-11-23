@@ -58,6 +58,9 @@ struct Args {
     /// Model id reported by /v1/models and in responses
     #[arg(long, default_value = "qwen2.5-1.5b-instruct")]
     model_id: String,
+    /// Default system prompt when none is provided in request
+    #[arg(long)]
+    system: Option<String>,
     /// Load pre-quantized weights from this cache (startup drops to ~0.2 s)
     #[arg(long)]
     cache: Option<PathBuf>,
@@ -204,6 +207,7 @@ struct Inner {
     model_id: String,
     dtype_name: String,
     backend_name: String,
+    system_prompt: String,
     ctx: usize,
     seq: AtomicU64,
     metrics: ServerMetrics,
@@ -309,7 +313,7 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-fn build_messages(msgs: &[Message]) -> Vec<chat::Message> {
+fn build_messages(msgs: &[Message], default_system: &str) -> Vec<chat::Message> {
     let mut out: Vec<chat::Message> = msgs
         .iter()
         .map(|m| chat::Message {
@@ -318,7 +322,7 @@ fn build_messages(msgs: &[Message]) -> Vec<chat::Message> {
         })
         .collect();
     if !out.iter().any(|m| m.role == "system") {
-        out.insert(0, chat::system(chat::DEFAULT_SYSTEM));
+        out.insert(0, chat::system(default_system));
     }
     out
 }
@@ -337,7 +341,7 @@ impl AppState {
         if req.messages.is_empty() {
             return Err(anyhow!("messages must not be empty"));
         }
-        let messages = build_messages(&req.messages);
+        let messages = build_messages(&req.messages, &self.0.system_prompt);
         let prompt = chat::render(&messages);
         let prompt_ids = self.0.tok.encode(&prompt)?;
         let mut stop = self.0.cfg.eos_ids();
@@ -554,6 +558,11 @@ async fn main() -> Result<()> {
         args.max_concurrency, args.ctx
     );
 
+    let system_prompt = args
+        .system
+        .clone()
+        .unwrap_or_else(|| chat::DEFAULT_SYSTEM.to_string());
+
     let state = AppState(Arc::new(Inner {
         pool,
         tok,
@@ -562,6 +571,7 @@ async fn main() -> Result<()> {
         model_id: args.model_id,
         dtype_name,
         backend_name,
+        system_prompt,
         ctx: args.ctx,
         seq: AtomicU64::new(0),
         metrics: ServerMetrics::new(),
@@ -1012,9 +1022,10 @@ mod tests {
             role: "user".into(),
             content: Value::String("hi".into()),
         }];
-        let built = build_messages(&msgs);
+        let built = build_messages(&msgs, chat::DEFAULT_SYSTEM);
         assert_eq!(built.len(), 2);
         assert_eq!(built[0].role, "system");
+        assert_eq!(built[1].content, chat::DEFAULT_SYSTEM);
         assert_eq!(built[1].role, "user");
         assert_eq!(built[1].content, "hi");
 
@@ -1029,7 +1040,7 @@ mod tests {
                 content: Value::String("hi".into()),
             },
         ];
-        let built2 = build_messages(&msgs_with_sys);
+        let built2 = build_messages(&msgs_with_sys, chat::DEFAULT_SYSTEM);
         assert_eq!(built2.len(), 2);
         assert_eq!(built2[0].content, "custom system");
     }
