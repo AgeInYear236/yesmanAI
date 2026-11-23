@@ -158,6 +158,72 @@ struct Layer {
     w_down: Weight,
 }
 
+/// Scratch buffers reused across layers and across decode steps. Without this
+/// a single token allocated ~11 vectors per layer (~300 malloc + 3 MB of
+/// zeroing per token); now everything is resized once and sliced.
+struct Workspace {
+    x: Vec<f32>,
+    hb: Vec<f32>,
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    attn: Vec<f32>,
+    o: Vec<f32>,
+    hb2: Vec<f32>,
+    gate: Vec<f32>,
+    up: Vec<f32>,
+    act: Vec<f32>,
+    down: Vec<f32>,
+    xf: Vec<f32>,
+    scores: Vec<f32>,
+    logits: Vec<f32>,
+}
+
+impl Workspace {
+    fn new(cfg: &Config) -> Self {
+        let h = cfg.hidden_size;
+        let inter = cfg.intermediate_size;
+        let kv_dim = cfg.kv_dim();
+        Self {
+            x: vec![0.0; h],
+            hb: vec![0.0; h],
+            q: vec![0.0; h],
+            k: vec![0.0; kv_dim],
+            v: vec![0.0; kv_dim],
+            attn: vec![0.0; h],
+            o: vec![0.0; h],
+            hb2: vec![0.0; h],
+            gate: vec![0.0; inter],
+            up: vec![0.0; inter],
+            act: vec![0.0; inter],
+            down: vec![0.0; h],
+            xf: vec![0.0; h],
+            scores: vec![0.0; cfg.num_attention_heads],
+            logits: vec![0.0; cfg.vocab_size],
+        }
+    }
+
+    /// Grow (never shrink) all buffers for `m` tokens. Callers must slice to
+    /// the exact length -- leftover elements from a larger prefill are stale.
+    fn ensure(&mut self, m: usize, h: usize, inter: usize, kv_dim: usize) {
+        let n_h = m * h;
+        let n_i = m * inter;
+        let n_kv = m * kv_dim;
+        self.x.resize(n_h, 0.0);
+        self.hb.resize(n_h, 0.0);
+        self.q.resize(n_h, 0.0);
+        self.k.resize(n_kv, 0.0);
+        self.v.resize(n_kv, 0.0);
+        self.attn.resize(n_h, 0.0);
+        self.o.resize(n_h, 0.0);
+        self.hb2.resize(n_h, 0.0);
+        self.gate.resize(n_i, 0.0);
+        self.up.resize(n_i, 0.0);
+        self.act.resize(n_i, 0.0);
+        self.down.resize(n_h, 0.0);
+    }
+}
+
 pub struct Qwen2 {
     pub cfg: Config,
     embed: Weight,
@@ -166,6 +232,7 @@ pub struct Qwen2 {
     cos: Vec<f32>,
     sin: Vec<f32>,
     kv: KvCache,
+    ws: Workspace,
 }
 
 impl Qwen2 {
@@ -225,7 +292,8 @@ impl Qwen2 {
         let (cos, sin) = ops::rope_tables(max_ctx, cfg.head_dim(), cfg.rope_theta);
         let kv = KvCache::new(cfg.num_hidden_layers, max_ctx, cfg.kv_dim());
 
-        Ok(Self { cfg, embed, final_norm, layers, cos, sin, kv })
+        let ws = Workspace::new(&cfg);
+        Ok(Self { cfg, embed, final_norm, layers, cos, sin, kv, ws })
     }
 
     /// Load from a pre-quantized cache produced by [`Qwen2::save_cache`].
@@ -269,7 +337,8 @@ impl Qwen2 {
 
         let (cos, sin) = ops::rope_tables(max_ctx, cfg.head_dim(), cfg.rope_theta);
         let kv = KvCache::new(cfg.num_hidden_layers, max_ctx, cfg.kv_dim());
-        Ok(Self { cfg, embed, final_norm, layers, cos, sin, kv })
+        let ws = Workspace::new(&cfg);
+        Ok(Self { cfg, embed, final_norm, layers, cos, sin, kv, ws })
     }
 
     /// Write every tensor (weights + norms + biases) to a reusable cache.
@@ -388,6 +457,7 @@ impl Qwen2 {
         let group = cfg.gqa_group();
         let eps = cfg.rms_norm_eps;
         let scale = 1.0 / (hd as f32).sqrt();
+        let vocab = cfg.vocab_size;
         let profiling = std::env::var_os("YESMAN_PROFILE").is_some();
         let mut prof = Profile::default();
         let now = || std::time::Instant::now();
@@ -401,41 +471,58 @@ impl Qwen2 {
             };
         }
 
+        // Split the borrows: the scratch space is mutable, everything else is
+        // read-only during a forward pass (except the KV cache, reborrowed
+        // below for each layer's writes).
+        let ws = &mut self.ws;
+        let layers = &self.layers;
+        let kv = &mut self.kv;
+        let cos = &self.cos;
+        let sin = &self.sin;
+        let embed = &self.embed;
+        let final_norm = &self.final_norm;
+
+        let t_max = pos0 + m;
+        ws.ensure(m, h, inter, kv_dim);
+        ws.scores.resize(m * n_heads * t_max, 0.0);
+        let scores = &mut ws.scores[..m * n_heads * t_max];
+        let x = &mut ws.x[..m * h];
+        let hb = &mut ws.hb[..m * h];
+        let q = &mut ws.q[..m * h];
+        let k = &mut ws.k[..m * kv_dim];
+        let v = &mut ws.v[..m * kv_dim];
+        let attn = &mut ws.attn[..m * h];
+        let o = &mut ws.o[..m * h];
+        let hb2 = &mut ws.hb2[..m * h];
+        let gate = &mut ws.gate[..m * inter];
+        let up = &mut ws.up[..m * inter];
+        let act = &mut ws.act[..m * inter];
+        let down = &mut ws.down[..m * h];
+
         // --- embedding lookup -------------------------------------------------
-        let mut x = vec![0.0f32; m * h];
         for (i, &t) in tokens.iter().enumerate() {
-            let row = self.embed.gather(t as usize);
+            let row = embed.gather(t as usize);
             x[i * h..(i + 1) * h].copy_from_slice(&row);
         }
 
-        for (li, layer) in self.layers.iter().enumerate() {
+        for (li, layer) in layers.iter().enumerate() {
             // --- attention ----------------------------------------------------
             mark = now();
-            let mut hb = vec![0.0f32; m * h];
-            ops::rmsnorm(&mut hb, &x, &layer.in_norm, eps);
+            ops::rmsnorm(hb, x, &layer.in_norm, eps);
 
-            let mut q = vec![0.0f32; m * h];
-            layer.wq.matmul(&mut q, &hb, m, h, h);
-            add_bias(&mut q, &layer.bq);
-            let mut k = vec![0.0f32; m * kv_dim];
-            layer.wk.matmul(&mut k, &hb, m, h, kv_dim);
-            add_bias(&mut k, &layer.bk);
-            let mut v = vec![0.0f32; m * kv_dim];
-            layer.wv.matmul(&mut v, &hb, m, h, kv_dim);
-            add_bias(&mut v, &layer.bv);
+            layer.wq.matmul(q, hb, m, h, h);
+            add_bias(q, &layer.bq);
+            layer.wk.matmul(k, hb, m, h, kv_dim);
+            add_bias(k, &layer.bk);
+            layer.wv.matmul(v, hb, m, h, kv_dim);
+            add_bias(v, &layer.bv);
             lap!(qkv);
 
             for i in 0..m {
                 let pos = pos0 + i;
-                ops::rope(&mut q[i * h..(i + 1) * h], &self.cos, &self.sin, pos, hd);
-                ops::rope(
-                    &mut k[i * kv_dim..(i + 1) * kv_dim],
-                    &self.cos,
-                    &self.sin,
-                    pos,
-                    hd,
-                );
-                self.kv.write(
+                ops::rope(&mut q[i * h..(i + 1) * h], cos, sin, pos, hd);
+                ops::rope(&mut k[i * kv_dim..(i + 1) * kv_dim], cos, sin, pos, hd);
+                kv.write(
                     li,
                     pos,
                     &k[i * kv_dim..(i + 1) * kv_dim],
@@ -444,70 +531,103 @@ impl Qwen2 {
             }
             lap!(rope);
 
-            // One rayon task per (token, head): the flat [m, hidden] buffer is
-            // exactly m*n_heads chunks of head_dim.
-            let mut attn = vec![0.0f32; m * h];
-            let kv_ref = &self.kv;
-            attn.par_chunks_mut(hd).enumerate().for_each(|(idx, out_head)| {
-                let i = idx / n_heads;
-                let head = idx % n_heads;
-                let kv_head = head / group;
-                let qh = &q[i * h + head * hd..i * h + (head + 1) * hd];
-                let t_end = pos0 + i + 1;
+            // Exact two-pass softmax (numerically identical to the numpy
+            // reference) with a preallocated scores buffer: no per-head Vec
+            // allocation, no second rayon dispatch. The streaming/online
+            // variant is opt-in (YESMAN_ONLINE_ATTN=1); it saves one pass over
+            // V but accumulates a small rounding drift on quantized weights.
+            let kv_ref: &KvCache = kv;
+            let online_attn = std::env::var_os("YESMAN_ONLINE_ATTN").is_some();
+            attn.par_chunks_mut(hd)
+                .zip(scores.par_chunks_mut(t_max))
+                .enumerate()
+                .for_each(|(idx, (out_head, sbuf))| {
+                    for d in out_head.iter_mut() {
+                        *d = 0.0;
+                    }
+                    let i = idx / n_heads;
+                    let head = idx % n_heads;
+                    let kv_head = head / group;
+                    let qh = &q[i * h + head * hd..i * h + (head + 1) * hd];
+                    let t_end = pos0 + i + 1;
+                    let sbuf = &mut sbuf[..t_end];
 
-                let mut scores = vec![0.0f32; t_end];
-                for t in 0..t_end {
-                    let kh = &kv_ref.k(li, t)[kv_head * hd..(kv_head + 1) * hd];
-                    scores[t] = ops::dot(qh, kh) * scale;
-                }
-                ops::softmax(&mut scores);
-                for t in 0..t_end {
-                    let p = scores[t];
-                    if p == 0.0 {
-                        continue;
+                    if !online_attn {
+                        for (t, slot) in sbuf.iter_mut().enumerate() {
+                            let kh = &kv_ref.k(li, t)[kv_head * hd..(kv_head + 1) * hd];
+                            *slot = ops::dot(qh, kh) * scale;
+                        }
+                        ops::softmax(sbuf);
+                        for (t, &p) in sbuf.iter().enumerate() {
+                            if p == 0.0 {
+                                continue;
+                            }
+                            let vh = &kv_ref.v(li, t)[kv_head * hd..(kv_head + 1) * hd];
+                            for (a, &vv) in out_head.iter_mut().zip(vh) {
+                                *a += p * vv;
+                            }
+                        }
+                        return;
                     }
-                    let vh = &kv_ref.v(li, t)[kv_head * hd..(kv_head + 1) * hd];
-                    for d in 0..hd {
-                        out_head[d] += p * vh[d];
+
+                    let mut max = f32::NEG_INFINITY;
+                    let mut sum = 0.0f32;
+                    for t in 0..t_end {
+                        let kh = &kv_ref.k(li, t)[kv_head * hd..(kv_head + 1) * hd];
+                        let s = ops::dot(qh, kh) * scale;
+                        if s > max {
+                            let rescale = (max - s).exp();
+                            for a in out_head.iter_mut() {
+                                *a *= rescale;
+                            }
+                            sum *= rescale;
+                            max = s;
+                        }
+                        let p = (s - max).exp();
+                        sum += p;
+                        let vh = &kv_ref.v(li, t)[kv_head * hd..(kv_head + 1) * hd];
+                        for (a, &vv) in out_head.iter_mut().zip(vh) {
+                            *a += p * vv;
+                        }
                     }
-                }
-            });
+                    if sum > 0.0 {
+                        let inv = 1.0 / sum;
+                        for a in out_head.iter_mut() {
+                            *a *= inv;
+                        }
+                    }
+                });
 
             lap!(attn);
-            let mut o = vec![0.0f32; m * h];
-            layer.wo.matmul(&mut o, &attn, m, h, h);
-            ops::add_into(&mut x, &o);
+            layer.wo.matmul(o, attn, m, h, h);
+            ops::add_into(x, o);
             lap!(o_proj);
 
             // --- SwiGLU feed-forward -----------------------------------------
-            let mut hb2 = vec![0.0f32; m * h];
-            ops::rmsnorm(&mut hb2, &x, &layer.post_norm, eps);
-            let mut gate = vec![0.0f32; m * inter];
-            layer.w_gate.matmul(&mut gate, &hb2, m, h, inter);
-            let mut up = vec![0.0f32; m * inter];
-            layer.w_up.matmul(&mut up, &hb2, m, h, inter);
-            let mut act = vec![0.0f32; m * inter];
-            ops::swiglu(&mut act, &gate, &up);
-            let mut down = vec![0.0f32; m * h];
-            layer.w_down.matmul(&mut down, &act, m, inter, h);
-            ops::add_into(&mut x, &down);
+            ops::rmsnorm(hb2, x, &layer.post_norm, eps);
+            layer.w_gate.matmul(gate, hb2, m, h, inter);
+            layer.w_up.matmul(up, hb2, m, h, inter);
+            ops::swiglu(act, gate, up);
+            layer.w_down.matmul(down, act, m, inter, h);
+            ops::add_into(x, down);
             lap!(ffn);
         }
 
-        self.kv.set_len(pos0 + m);
+        kv.set_len(pos0 + m);
 
         // --- lm_head (tied embeddings) ---------------------------------------
-        let mut xf = vec![0.0f32; h];
-        ops::rmsnorm(&mut xf, &x[(m - 1) * h..m * h], &self.final_norm, eps);
-        let mut logits = vec![0.0f32; cfg.vocab_size];
-        self.embed.matmul(&mut logits, &xf, 1, h, cfg.vocab_size);
+        let xf = &mut ws.xf[..h];
+        ops::rmsnorm(xf, &x[(m - 1) * h..m * h], final_norm, eps);
+        let logits = &mut ws.logits[..vocab];
+        embed.matmul(logits, xf, 1, h, vocab);
         lap!(head);
         if profiling {
             let _ = mark;
             prof.dump();
         }
-        logits
+        logits.to_vec()
     }
+
 }
 
 #[derive(Default)]

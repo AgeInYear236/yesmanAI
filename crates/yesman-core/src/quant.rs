@@ -222,7 +222,7 @@ pub fn matmul_q8(out: &mut [f32], xq: &[BlockQ8], w: &Q8Tensor, m: usize, k: usi
             }
         });
     } else {
-        let c = 256.min(n).max(1);
+        let c = crate::ops::out_chunk(n);
         out.par_chunks_mut(c).enumerate().for_each(|(ci, o)| {
             let j0 = ci * c;
             for (j, o) in o.iter_mut().enumerate() {

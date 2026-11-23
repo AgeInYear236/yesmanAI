@@ -4,6 +4,17 @@
 
 use rayon::prelude::*;
 
+/// Output columns per rayon task for single-token decode.
+///
+/// A fixed small chunk (e.g. 256 outputs) creates thousands of tiny tasks per
+/// token; the dispatch overhead dominates the actual dot products. Aim for
+/// ~2 tasks per worker so memory bandwidth is saturated with minimal
+/// scheduling, while keeping enough slack for work stealing.
+pub fn out_chunk(n: usize) -> usize {
+    let workers = rayon::current_num_threads().max(1);
+    ((n + 2 * workers - 1) / (2 * workers)).max(64).min(n.max(1))
+}
+
 #[inline]
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
@@ -84,9 +95,9 @@ pub fn matmul(out: &mut [f32], x: &[f32], w: &[f32], m: usize, k: usize, n: usiz
             matmul_rows(o, &x[i * k..(i + 1) * k], w, k);
         });
     } else {
-        const CHUNK: usize = 128;
-        out.par_chunks_mut(CHUNK.min(n).max(1)).enumerate().for_each(|(c, o)| {
-            let j0 = c * CHUNK.min(n).max(1);
+        let c = out_chunk(n);
+        out.par_chunks_mut(c).enumerate().for_each(|(ci, o)| {
+            let j0 = ci * c;
             for j in 0..o.len() {
                 o[j] = 0.0;
             }
@@ -117,28 +128,49 @@ pub fn matmul_bias(out: &mut [f32], x: &[f32], w: &[f32], bias: &[f32], m: usize
 }
 
 /// RMSNorm over the last dimension: `x / sqrt(mean(x^2) + eps) * w`
+///
+/// A rayon task for a single 1536-element row costs more than the row itself;
+/// only parallelize when there are several rows (prefill).
 pub fn rmsnorm(out: &mut [f32], x: &[f32], weight: &[f32], eps: f32) {
     let d = weight.len();
-    out.par_chunks_mut(d)
-        .zip(x.par_chunks(d))
-        .for_each(|(o, xi)| {
-            let ss = dot(xi, xi) / d as f32;
-            let scale = 1.0 / (ss + eps).sqrt();
-            for ((o, v), w) in o.iter_mut().zip(xi).zip(weight) {
-                *o = *v * scale * w;
-            }
-        });
+    let rows = x.len() / d;
+    let row = |o: &mut [f32], xi: &[f32]| {
+        let ss = dot(xi, xi) / d as f32;
+        let scale = 1.0 / (ss + eps).sqrt();
+        for ((o, v), w) in o.iter_mut().zip(xi).zip(weight) {
+            *o = *v * scale * w;
+        }
+    };
+    if rows <= 2 {
+        for (o, xi) in out.chunks_mut(d).zip(x.chunks(d)) {
+            row(o, xi);
+        }
+    } else {
+        out.par_chunks_mut(d).zip(x.par_chunks(d)).for_each(|(o, xi)| row(o, xi));
+    }
 }
 
 pub fn add_into(a: &mut [f32], b: &[f32]) {
-    a.par_iter_mut().zip(b.par_iter()).for_each(|(a, b)| *a += b);
+    if a.len() <= 16384 {
+        for (a, b) in a.iter_mut().zip(b) {
+            *a += b;
+        }
+    } else {
+        a.par_iter_mut().zip(b.par_iter()).for_each(|(a, b)| *a += b);
+    }
 }
 
 /// `out = silu(gate) * up` (SwiGLU feed-forward)
 pub fn swiglu(out: &mut [f32], gate: &[f32], up: &[f32]) {
-    out.par_iter_mut()
-        .zip(gate.par_iter().zip(up.par_iter()))
-        .for_each(|(o, (g, u))| *o = (g / (1.0 + (-g).exp())) * u);
+    if out.len() <= 16384 {
+        for (o, (g, u)) in out.iter_mut().zip(gate.iter().zip(up.iter())) {
+            *o = (g / (1.0 + (-g).exp())) * u;
+        }
+    } else {
+        out.par_iter_mut()
+            .zip(gate.par_iter().zip(up.par_iter()))
+            .for_each(|(o, (g, u))| *o = (g / (1.0 + (-g).exp())) * u);
+    }
 }
 
 pub fn softmax(x: &mut [f32]) {

@@ -98,7 +98,7 @@ pub fn matmul(out: &mut [f32], x: &[f32], w: &Bf16Tensor, m: usize, k: usize, n:
             }
         });
     } else {
-        let c = 256.min(n).max(1);
+        let c = crate::ops::out_chunk(n);
         out.par_chunks_mut(c).enumerate().for_each(|(ci, o)| {
             let j0 = ci * c;
             for (j, o) in o.iter_mut().enumerate() {

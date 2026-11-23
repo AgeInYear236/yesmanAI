@@ -340,7 +340,7 @@ pub fn matmul_q8q4k(
             }
         });
     } else {
-        let c = 256.min(n).max(1);
+        let c = crate::ops::out_chunk(n);
         out.par_chunks_mut(c).enumerate().for_each(|(ci, o)| {
             let j0 = ci * c;
             let xrow = &xq[..bpr];

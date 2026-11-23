@@ -135,22 +135,40 @@ decode on 20 cores:
 
 | weights | load from safetensors | load from cache | decode |
 | --- | --- | --- | --- |
-| bf16 | ~0.9 s | — | ~3.3 tok/s |
-| Q8_0 | ~5.8 s | ~1.0 s | ~5 tok/s |
-| Q4_0 | ~5.7 s | ~0.3 s | ~5 tok/s |
-| Q4_K (`q4k`) | ~5.4 s | ~3.5 s | ~4 tok/s |
-| Q4_K_M (`q4km`) | ~5.9 s | ~2.0 s | ~4.4 tok/s |
+| bf16 | ~0.9 s | — | ~4 tok/s |
+| Q8_0 | ~5.8 s | ~2.0 s | ~11 tok/s |
+| Q4_0 | ~5.7 s | ~1.3 s | ~15 tok/s |
+| Q4_K (`q4k`) | ~5.4 s | ~1.3 s | ~16 tok/s |
+| Q4_K_M (`q4km`) | ~5.9 s | ~2.0 s | ~11 tok/s |
 
 Q4_0 weights are 4-bit with activations in Q8_0. It is noticeably lossier than
 Q8_0 on a 1.5B model — text stays coherent but top-8 logits shift.
 `--dtype q4km` is the sweet spot; `q4k` is for when 974 MB matters.
 
-Performance notes: for `m = 1` (decode) matmul must split the **output**
-dimension — splitting by input rows leaves 19 of 20 cores idle. Also, routing
-tiny activation quantization through rayon once per weight matrix (~300
-dispatches/token) cost more than the quantization itself. `YESMAN_PROFILE=1`
-prints a per-stage breakdown; `cargo run --release -p yesman-core --example
-bench_matmul` microbenchmarks the kernels (all ~20 GB/s at lm_head size).
+### Performance notes
+
+After three CPU passes this is now **memory-bandwidth bound** (~20 GB/s on this
+machine): at Q8, `ffn` reads 1.15 G weights x 1.125 B = 1.3 GB and takes ~65 ms,
+`head` reads 262 MB and takes ~12 ms -- both essentially the theoretical
+minimum. What got us there from ~2.8 tok/s:
+
+1. Decode matmul must split the **output** dimension, not the input rows (with
+   `m = 1` that left 19 of 20 cores idle). `ops::out_chunk` now targets ~2
+   rayon tasks per worker; a fixed 256-output chunk spawned ~19k tiny tasks
+   per token and was pure dispatch overhead (2.8 -> 10.7 tok/s).
+2. Tiny activation quantization must not go through rayon (~300 dispatches /
+   token cost more than the quantization).
+3. `Qwen2` owns a `Workspace` of reused buffers: decode allocates **zero**
+   vectors (was ~11 per layer). Small `rmsnorm`/`swiglu`/`add_into` run
+   sequentially; the attention `scores` buffer is preallocated.
+4. A streaming (online) softmax is available with `YESMAN_ONLINE_ATTN=1` (one
+   pass over V), but it accumulates ~0.15 logit of drift on quantized weights
+   over 28 layers, so the default stays the exact two-pass softmax, which
+   matches numpy to 3e-5.
+
+`YESMAN_PROFILE=1` prints a per-stage breakdown; `cargo run --release -p
+yesman-core --example bench_matmul` microbenchmarks the kernels. Further CPU
+gains now require fewer bytes per weight (q4k), not faster kernels.
 
 ## Verification
 
