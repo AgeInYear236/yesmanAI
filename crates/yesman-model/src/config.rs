@@ -13,7 +13,10 @@ pub struct Config {
     pub vocab_size: usize,
     pub rms_norm_eps: f32,
     pub max_position_embeddings: usize,
+    #[serde(default = "default_rope_theta")]
     pub rope_theta: f32,
+    #[serde(default)]
+    pub rope_parameters: Option<serde_json::Value>,
     #[serde(default)]
     pub tie_word_embeddings: bool,
     #[serde(default)]
@@ -22,10 +25,20 @@ pub struct Config {
     pub eos_token_id: Option<serde_json::Value>,
 }
 
+fn default_rope_theta() -> f32 {
+    1000000.0
+}
+
 impl Config {
     pub fn from_dir(dir: &Path) -> Result<Self> {
         let s = std::fs::read_to_string(dir.join("config.json"))?;
-        Ok(serde_json::from_str(&s)?)
+        let mut cfg: Self = serde_json::from_str(&s)?;
+        if let Some(ref params) = cfg.rope_parameters
+            && let Some(theta) = params.get("rope_theta").and_then(|v| v.as_f64())
+        {
+            cfg.rope_theta = theta as f32;
+        }
+        Ok(cfg)
     }
 
     /// Qwen2 derives head_dim from hidden_size / num_heads (there is no

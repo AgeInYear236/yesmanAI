@@ -421,6 +421,7 @@ impl Qwen2 {
             rope_theta: gguf
                 .metadata_f32("qwen2.rope.freq_base")
                 .unwrap_or(1000000.0),
+            rope_parameters: None,
             tie_word_embeddings: true,
             bos_token_id: gguf
                 .metadata_u32("tokenizer.ggml.bos_token_id")
