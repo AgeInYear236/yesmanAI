@@ -28,7 +28,7 @@ echo "=========================================================="
 echo " Step 1: Checking Blender MCP Tool-Calling Dataset"
 echo "=========================================================="
 if [ ! -f "training/data/train.jsonl" ]; then
-    $PYTHON training/prepare_dataset.py
+    $PYTHON training/generate_3d_dataset.py
 else
     echo "Dataset already present in training/data/ (train.jsonl, val.jsonl)"
 fi

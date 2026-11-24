@@ -50,7 +50,7 @@ def main():
     parser.add_argument("--grad-accum", type=int, default=8)
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
-    parser.add_argument("--max-seq-len", type=int, default=1024)
+    parser.add_argument("--max-seq-len", type=int, default=512)
     parser.add_argument("--merge-only", action="store_true")
     args = parser.parse_args()
 
@@ -100,6 +100,10 @@ def main():
         gpu_name = torch.cuda.get_device_name(0)
         vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
         print(f"CUDA device detected: {gpu_name} ({vram_gb:.2f} GB VRAM)")
+
+        # Initialize cuBLAS handle before loading any weights to avoid allocation conflict
+        let_dummy = torch.matmul(torch.zeros(1, 1, device="cuda"), torch.zeros(1, 1, device="cuda"))
+        del let_dummy
 
         from peft import prepare_model_for_kbit_training
         from transformers import BitsAndBytesConfig

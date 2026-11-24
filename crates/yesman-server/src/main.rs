@@ -542,10 +542,17 @@ impl AppState {
 
     fn plan_responses(&self, req: &ResponsesRequest) -> Result<RequestPlan> {
         let mut msgs = Vec::new();
-        let sys_text = req
-            .instructions
-            .clone()
-            .unwrap_or_else(|| self.0.system_prompt.clone());
+        // If external instructions contain OpenCode Code Mode harness clutter,
+        // use our clean, focused Blender system prompt to keep prefill fast and prevent tool confusion.
+        let sys_text = if let Some(ref instrs) = req.instructions {
+            if instrs.contains("Code Mode") || instrs.contains("Harness") {
+                self.0.system_prompt.clone()
+            } else {
+                instrs.clone()
+            }
+        } else {
+            self.0.system_prompt.clone()
+        };
         msgs.push(chat::system(sys_text));
 
         match &req.input {
@@ -578,6 +585,16 @@ impl AppState {
                     let name = t
                         .get("name")
                         .or_else(|| t.get("function").and_then(|f| f.get("name")))?;
+                    let name_str = name.as_str()?;
+                    // Keep Blender tools
+                    let is_blender = name_str.contains("blender")
+                        || name_str.contains("scene")
+                        || name_str.contains("object")
+                        || name_str.contains("viewport")
+                        || name_str.contains("look");
+                    if !is_blender && tools_vec.len() > 5 {
+                        return None;
+                    }
                     let desc = t
                         .get("description")
                         .or_else(|| t.get("function").and_then(|f| f.get("description")));
