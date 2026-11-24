@@ -50,9 +50,11 @@ def main():
     parser.add_argument("--grad-accum", type=int, default=8)
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
-    parser.add_argument("--max-seq-len", type=int, default=2048)
+    parser.add_argument("--max-seq-len", type=int, default=1024)
     parser.add_argument("--merge-only", action="store_true")
     args = parser.parse_args()
+
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     model_path = Path(args.model)
     if not model_path.exists():
@@ -87,25 +89,35 @@ def main():
     if not torch.cuda.is_available():
         print("WARNING: CUDA is not available, training on CPU will be slow!")
         device_map = "cpu"
-        dtype = torch.float32
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=torch.float32,
+            device_map=device_map,
+            trust_remote_code=True,
+        )
     else:
         device_map = "auto"
         gpu_name = torch.cuda.get_device_name(0)
         vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
         print(f"CUDA device detected: {gpu_name} ({vram_gb:.2f} GB VRAM)")
-        dtype = torch.bfloat16
 
-    print(f"Loading base model {model_id}...")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=dtype,
-        device_map=device_map,
-        trust_remote_code=True,
-    )
-    try:
-        model.activation_checkpointing_enable()
-    except AttributeError:
-        model.gradient_checkpointing_enable()
+        from peft import prepare_model_for_kbit_training
+        from transformers import BitsAndBytesConfig
+
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+        )
+        print(f"Loading base model {model_id} in 4-bit NF4 (uses ~1.1 GB VRAM)...")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            quantization_config=bnb_config,
+            device_map=device_map,
+            trust_remote_code=True,
+        )
+        model = prepare_model_for_kbit_training(model)
 
     print(f"Setting up LoRA (r={args.lora_r}, alpha={args.lora_alpha})...")
     lora_config = LoraConfig(
@@ -197,11 +209,11 @@ def main():
         lr_scheduler_type="cosine",
         warmup_steps=10,
         logging_steps=10,
-        eval_strategy="epoch",
-        save_strategy="epoch",
-        save_total_limit=2,
-        bf16=True if dtype == torch.bfloat16 else False,
+        eval_strategy="no",
+        save_strategy="no",
+        bf16=True if torch.cuda.is_available() else False,
         fp16=False,
+        optim="paged_adamw_8bit" if torch.cuda.is_available() else "adamw_torch",
         dataloader_num_workers=2,
         report_to="none",
     )
@@ -224,7 +236,21 @@ def main():
     print("\n========================================================")
     print(" Merging LoRA into base model for native Rust inference ")
     print("========================================================")
-    merged_model = model.merge_and_unload()
+    del model, trainer
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    from peft import PeftModel
+    print("Loading base model in bfloat16 on CPU for merge...")
+    base_model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        torch_dtype=torch.bfloat16,
+        device_map="cpu",
+        trust_remote_code=True,
+    )
+    peft_model = PeftModel.from_pretrained(base_model, args.output_dir)
+    merged_model = peft_model.merge_and_unload()
     print(f"Saving merged model to {args.merged_dir}...")
     merged_model.save_pretrained(args.merged_dir, safe_serialization=True)
     tokenizer.save_pretrained(args.merged_dir)
