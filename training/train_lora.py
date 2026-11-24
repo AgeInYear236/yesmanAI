@@ -102,7 +102,10 @@ def main():
         device_map=device_map,
         trust_remote_code=True,
     )
-    model.gradient_checkpointing_enable()
+        try:
+            model.activation_checkpointing_enable()
+        except AttributeError:
+            model.gradient_checkpointing_enable()
 
     print(f"Setting up LoRA (r={args.lora_r}, alpha={args.lora_alpha})...")
     lora_config = LoraConfig(
@@ -192,7 +195,7 @@ def main():
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
         lr_scheduler_type="cosine",
-        warmup_ratio=0.05,
+        warmup_steps=10,
         logging_steps=10,
         eval_strategy="epoch",
         save_strategy="epoch",

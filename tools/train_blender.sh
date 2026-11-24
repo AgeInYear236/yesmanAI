@@ -20,9 +20,13 @@ if [ ! -f "$PYTHON" ]; then
 fi
 
 echo "=========================================================="
-echo " Step 1: Preparing Blender MCP Tool-Calling Dataset"
+echo " Step 1: Checking Blender MCP Tool-Calling Dataset"
 echo "=========================================================="
-$PYTHON training/prepare_dataset.py
+if [ ! -f "training/data/train.jsonl" ]; then
+    $PYTHON training/prepare_dataset.py
+else
+    echo "Dataset already present in training/data/ (train.jsonl, val.jsonl)"
+fi
 
 echo
 echo "=========================================================="
