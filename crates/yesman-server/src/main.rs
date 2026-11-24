@@ -606,10 +606,14 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
+        .route("/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/chat/completions", post(chat_completions))
         .route("/v1/completions", post(text_completions))
+        .route("/completions", post(text_completions))
         .route("/metrics", get(metrics_handler))
         .route("/stats", get(stats_handler))
+        .fallback(fallback_handler)
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -621,6 +625,19 @@ async fn main() -> Result<()> {
         .await?;
     println!("yesman-server stopped cleanly.");
     Ok(())
+}
+
+async fn fallback_handler(req: axum::extract::Request) -> impl IntoResponse {
+    eprintln!("Unhandled HTTP request: {} {}", req.method(), req.uri());
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "error": {
+                "message": format!("Route {} {} not found", req.method(), req.uri()),
+                "type": "invalid_request_error"
+            }
+        })),
+    )
 }
 
 async fn shutdown_signal() {
@@ -653,14 +670,26 @@ async fn health() -> &'static str {
 }
 
 async fn models(State(state): State<AppState>) -> Json<Value> {
+    let now = now_secs();
+    let mut data = vec![json!({
+        "id": state.0.model_id,
+        "object": "model",
+        "created": now,
+        "owned_by": "yesman",
+    })];
+    for name in ["Carp-1", "qwen2.5-1.5b-instruct", "default", "carp-1"] {
+        if name != state.0.model_id {
+            data.push(json!({
+                "id": name,
+                "object": "model",
+                "created": now,
+                "owned_by": "yesman",
+            }));
+        }
+    }
     Json(json!({
         "object": "list",
-        "data": [{
-            "id": state.0.model_id,
-            "object": "model",
-            "created": now_secs(),
-            "owned_by": "yesman",
-        }]
+        "data": data,
     }))
 }
 
