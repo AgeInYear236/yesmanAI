@@ -1331,6 +1331,8 @@ async fn non_stream_responses(state: AppState, plan: RequestPlan) -> impl IntoRe
                 .metrics
                 .record_completion(prompt_len, completion_tokens, duration_ms, true);
             let (clean_text, calls) = yesman_model::parse_tool_calls(&text);
+            eprintln!("RAW GENERATED TEXT: {text:?}");
+            eprintln!("PARSED CALLS: {calls:?}");
             let output_items = if !calls.is_empty() {
                 calls
                     .into_iter()

@@ -269,20 +269,56 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
     while let Some(start) = cur.find("<tool_call>") {
         remaining.push_str(&cur[..start]);
         let after_start = &cur[start + "<tool_call>".len()..];
-        if let Some(end) = after_start.find("</tool_call>") {
-            let json_text = after_start[..end].trim();
-            if let Ok(v) = serde_json::from_str::<Value>(json_text)
-                && let (Some(name), Some(args)) =
-                    (v.get("name").and_then(Value::as_str), v.get("arguments"))
-            {
-                calls.push(ToolCall {
-                    name: name.to_string(),
-                    arguments: args.clone(),
-                });
+        if let Some(brace_start) = after_start.find('{') {
+            // Parse matching JSON object
+            let mut depth = 0usize;
+            let mut in_str = false;
+            let mut escape = false;
+            let mut brace_end = None;
+
+            for (idx, ch) in after_start[brace_start..].char_indices() {
+                if escape {
+                    escape = false;
+                    continue;
+                }
+                match ch {
+                    '\\' => escape = true,
+                    '"' => in_str = !in_str,
+                    '{' if !in_str => depth += 1,
+                    '}' if !in_str => {
+                        depth -= 1;
+                        if depth == 0 {
+                            brace_end = Some(brace_start + idx + 1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
             }
-            cur = &after_start[end + "</tool_call>".len()..];
+
+            if let Some(end_idx) = brace_end {
+                let json_text = after_start[brace_start..end_idx].trim();
+                if let Ok(v) = serde_json::from_str::<Value>(json_text)
+                    && let (Some(name), Some(args)) =
+                        (v.get("name").and_then(Value::as_str), v.get("arguments"))
+                {
+                    calls.push(ToolCall {
+                        name: name.to_string(),
+                        arguments: args.clone(),
+                    });
+                }
+                let skip_after = if let Some(tag_end) = after_start[end_idx..].find("</tool_call>") {
+                    end_idx + tag_end + "</tool_call>".len()
+                } else {
+                    end_idx
+                };
+                cur = &after_start[skip_after..];
+            } else {
+                remaining.push_str(cur);
+                return (remaining.trim().to_string(), calls);
+            }
         } else {
-            // Unclosed tool call tag
+            // Unclosed tool call tag without valid JSON
             remaining.push_str(cur);
             return (remaining.trim().to_string(), calls);
         }
@@ -316,6 +352,32 @@ Let me know if you need anything else!
         assert_eq!(calls[0].arguments, json!({}));
         assert!(text.contains("Sure, I will check the scene now."));
         assert!(text.contains("Let me know if you need anything else!"));
+    }
+
+    #[test]
+    fn parse_unclosed_tool_call() {
+        let unclosed = r#"<tool_call>
+{"name": "create_sphere", "arguments": {"radius": 1.0}}"#;
+        let (text, calls) = parse_tool_calls(unclosed);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "create_sphere");
+        assert_eq!(calls[0].arguments, json!({"radius": 1.0}));
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn parse_nested_tool_call_tag() {
+        let nested = r#"<tool_call>
+<tool_call>
+{"name": "execute_blender_code", "arguments": {"code": "import bpy\nbpy.ops.mesh.primitive_uv_sphere_add()"}}
+</tool_call>"#;
+        let (_, calls) = parse_tool_calls(nested);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "execute_blender_code");
+        assert_eq!(
+            calls[0].arguments,
+            json!({"code": "import bpy\nbpy.ops.mesh.primitive_uv_sphere_add()"})
+        );
     }
 
     #[test]
