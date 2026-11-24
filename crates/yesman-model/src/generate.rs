@@ -32,16 +32,20 @@ pub fn generate(
     if prompt_ids.is_empty() {
         return Err(anyhow!("empty prompt"));
     }
-    if prompt_ids.len() >= opts.max_ctx {
-        return Err(anyhow!("prompt longer than context ({})", opts.max_ctx));
-    }
+    let prompt_slice = if prompt_ids.len() >= opts.max_ctx {
+        let budget = opts.max_ctx.saturating_sub(16).max(1);
+        let start = prompt_ids.len().saturating_sub(budget);
+        &prompt_ids[start..]
+    } else {
+        prompt_ids
+    };
 
     model.reset();
-    let mut history = prompt_ids.to_vec();
-    let mut logits = model.forward(prompt_ids, 0);
+    let mut history = prompt_slice.to_vec();
+    let mut logits = model.forward(prompt_slice, 0);
     let mut out_ids: Vec<u32> = Vec::new();
     let mut text = String::new();
-    let mut pos = prompt_ids.len();
+    let mut pos = prompt_slice.len();
 
     for _ in 0..opts.max_new_tokens {
         let next = sampler.sample(&mut logits, &history);

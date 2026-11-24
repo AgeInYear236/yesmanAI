@@ -46,14 +46,14 @@ struct Args {
     #[arg(long, default_value = "auto")]
     device: String,
     /// Context window size per session
-    #[arg(long, default_value_t = 4096)]
+    #[arg(long, default_value_t = 16384)]
     ctx: usize,
     /// Maximum concurrent model sessions running in parallel (default: 4)
     #[arg(long, default_value_t = 4)]
     max_concurrency: usize,
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
-    #[arg(long, default_value_t = 8000)]
+    #[arg(long, default_value_t = 17017)]
     port: u16,
     /// Model id reported by /v1/models and in responses
     #[arg(long, default_value = "Carp-1")]
@@ -420,11 +420,19 @@ impl AppState {
             stop.push(id);
         }
         let max_ctx = self.0.ctx;
+        let budget = max_ctx.saturating_sub(64).max(1);
+        let prompt_ids = if prompt_ids.len() > budget {
+            let start = prompt_ids.len() - budget;
+            prompt_ids[start..].to_vec()
+        } else {
+            prompt_ids
+        };
         let opts = GenerateOptions {
             max_new_tokens: req
                 .max_tokens
                 .unwrap_or(512)
-                .min(max_ctx.saturating_sub(prompt_ids.len())),
+                .min(max_ctx.saturating_sub(prompt_ids.len()))
+                .max(16),
             stop_ids: stop,
             max_ctx,
         };
@@ -493,11 +501,19 @@ impl AppState {
         }
 
         let max_ctx = self.0.ctx;
+        let budget = max_ctx.saturating_sub(64).max(1);
+        let prompt_ids = if prompt_ids.len() > budget {
+            let start = prompt_ids.len() - budget;
+            prompt_ids[start..].to_vec()
+        } else {
+            prompt_ids
+        };
         let opts = GenerateOptions {
             max_new_tokens: req
                 .max_tokens
                 .unwrap_or(512)
-                .min(max_ctx.saturating_sub(prompt_ids.len())),
+                .min(max_ctx.saturating_sub(prompt_ids.len()))
+                .max(16),
             stop_ids: stop,
             max_ctx,
         };
@@ -597,11 +613,19 @@ impl AppState {
             stop.push(id);
         }
         let max_ctx = self.0.ctx;
+        let budget = max_ctx.saturating_sub(64).max(1);
+        let prompt_ids = if prompt_ids.len() > budget {
+            let start = prompt_ids.len() - budget;
+            prompt_ids[start..].to_vec()
+        } else {
+            prompt_ids
+        };
         let opts = GenerateOptions {
             max_new_tokens: req
                 .max_output_tokens
                 .unwrap_or(512)
-                .min(max_ctx.saturating_sub(prompt_ids.len())),
+                .min(max_ctx.saturating_sub(prompt_ids.len()))
+                .max(16),
             stop_ids: stop,
             max_ctx,
         };

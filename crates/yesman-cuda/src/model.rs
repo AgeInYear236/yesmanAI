@@ -647,23 +647,28 @@ impl CudaQwen2 {
         if prompt_ids.is_empty() {
             anyhow::bail!("empty prompt");
         }
-        if prompt_ids.len() >= opts.max_ctx {
-            anyhow::bail!("prompt longer than context ({})", opts.max_ctx);
-        }
+        let prompt_slice = if prompt_ids.len() >= opts.max_ctx {
+            let budget = opts.max_ctx.saturating_sub(16).max(1);
+            let start = prompt_ids.len().saturating_sub(budget);
+            &prompt_ids[start..]
+        } else {
+            prompt_ids
+        };
 
         self.reset();
-        let mut history = prompt_ids.to_vec();
+        let mut history = prompt_slice.to_vec();
         let mut logits = Vec::new();
 
         // Batched prefill on GPU (chunks of up to GPU_PREFILL_CHUNK tokens in parallel)
         let mut pos = 0usize;
-        for chunk in prompt_ids.chunks(GPU_PREFILL_CHUNK) {
+        for chunk in prompt_slice.chunks(GPU_PREFILL_CHUNK) {
             logits = self.prefill_chunk(chunk, pos, cpu_model)?;
             pos += chunk.len();
         }
 
         let mut out_ids: Vec<u32> = Vec::new();
         let mut text = String::new();
+        let mut pos = prompt_slice.len();
 
         for _ in 0..opts.max_new_tokens {
             let next = sampler.sample(&mut logits, &history);
