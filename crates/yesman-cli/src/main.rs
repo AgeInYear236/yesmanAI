@@ -82,6 +82,14 @@ struct Args {
     /// Calculate perplexity on the provided text file and exit
     #[arg(long)]
     perplexity: Option<PathBuf>,
+
+    /// Connect to an MCP server via stdio command (e.g. "op-blender-mcp")
+    #[arg(long)]
+    mcp: Option<String>,
+
+    /// Auto-connect to local Blender MCP server
+    #[arg(long)]
+    blender: bool,
 }
 
 fn main() -> Result<()> {
@@ -246,18 +254,77 @@ fn main() -> Result<()> {
         Engine::Cpu(model)
     };
 
+    let mut mcp_client = if args.blender {
+        let venv_cmd = "/home/zj/Prog/op-blender-mcp/.venv/bin/op-blender-mcp";
+        let default_cmd = if std::path::Path::new(venv_cmd).exists() {
+            venv_cmd
+        } else {
+            "op-blender-mcp"
+        };
+        eprintln!("connecting to Blender MCP server ({default_cmd})...");
+        Some(yesman_model::McpClient::spawn(default_cmd)?)
+    } else if let Some(cmd) = &args.mcp {
+        eprintln!("connecting to MCP server (`{cmd}`)...");
+        Some(yesman_model::McpClient::spawn(cmd)?)
+    } else {
+        None
+    };
+
+    let system_prompt = if let Some(client) = &mut mcp_client {
+        let all_tools = client.list_tools()?;
+        let tools: Vec<yesman_model::McpTool> = if args.blender {
+            all_tools
+                .into_iter()
+                .filter(|t| {
+                    t.name.contains("blender")
+                        || t.name.contains("scene")
+                        || t.name.contains("object")
+                        || t.name.contains("viewport")
+                        || t.name.contains("texture")
+                })
+                .collect()
+        } else {
+            all_tools
+        };
+        eprintln!(
+            "loaded {} tools from MCP server: {}",
+            tools.len(),
+            tools
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let base_sys = args.system.clone().unwrap_or_else(|| {
+            "Ты — добрый, простой и отзывчивый помощник для работы в Blender. Общайся тепло, дружелюбно и живо, без заумных слов. Используй доступные инструменты Blender для выполнения запросов пользователя.".to_string()
+        });
+        yesman_model::format_tools_system_prompt(&base_sys, &tools)
+    } else {
+        args.system
+            .clone()
+            .unwrap_or_else(|| chat::DEFAULT_SYSTEM.to_string())
+    };
+
     if let Some(p) = &args.prompt {
-        let messages = if args.raw {
+        let mut messages = if args.raw {
             vec![chat::user(p.clone())]
         } else {
-            vec![system_message(&args), chat::user(p.clone())]
+            vec![chat::system(&system_prompt), chat::user(p.clone())]
         };
-        print_reply(&mut engine, &tok, &cfg, &messages, &opts, &mut sampler)?;
+        handle_turn(
+            &mut engine,
+            &tok,
+            &cfg,
+            &mut messages,
+            &opts,
+            &mut sampler,
+            &mut mcp_client,
+        )?;
         return Ok(());
     }
 
     // --- interactive REPL -----------------------------------------------------
-    let mut history: Vec<chat::Message> = vec![system_message(&args)];
+    let mut history: Vec<chat::Message> = vec![chat::system(&system_prompt)];
     let stdin = io::stdin();
     println!(
         "yesman — Qwen2.5 в чистом Rust. Пустая строка или /exit — выход, /reset — сброс истории.\n"
@@ -274,17 +341,63 @@ fn main() -> Result<()> {
             break;
         }
         if line == "/reset" || line == "/clear" {
-            history = vec![system_message(&args)];
+            history = vec![chat::system(&system_prompt)];
             engine.reset();
             println!("История диалога и KV-кэш сброшены.\n");
             continue;
         }
         history.push(chat::user(line.to_string()));
-        let reply = print_reply(&mut engine, &tok, &cfg, &history, &opts, &mut sampler)?;
-        history.push(chat::assistant(reply));
+        handle_turn(
+            &mut engine,
+            &tok,
+            &cfg,
+            &mut history,
+            &opts,
+            &mut sampler,
+            &mut mcp_client,
+        )?;
         println!();
     }
     Ok(())
+}
+
+fn handle_turn(
+    engine: &mut Engine,
+    tok: &Tokenizer,
+    cfg: &Config,
+    history: &mut Vec<chat::Message>,
+    opts: &GenerateOptions,
+    sampler: &mut Sampler,
+    mcp: &mut Option<yesman_model::McpClient>,
+) -> Result<String> {
+    let reply = print_reply(engine, tok, cfg, history, opts, sampler)?;
+    history.push(chat::assistant(&reply));
+
+    if let Some(client) = mcp {
+        let (_, calls) = yesman_model::parse_tool_calls(&reply);
+        if !calls.is_empty() {
+            for call in calls {
+                println!("\n🛠️  [Вызов инструмента MCP: {}]", call.name);
+                println!(
+                    "    Аргументы: {}",
+                    serde_json::to_string(&call.arguments).unwrap_or_default()
+                );
+                let result = match client.call_tool(&call.name, call.arguments) {
+                    Ok(res) => res,
+                    Err(e) => format!("Error executing tool {}: {e}", call.name),
+                };
+                println!("📦 [Результат]: {}\n", result.trim());
+                let tool_resp = yesman_model::format_tool_response(&result);
+                history.push(chat::user(tool_resp));
+            }
+            // Auto-continue generation so model explains tool result to user
+            print!("💬 ");
+            let followup = print_reply(engine, tok, cfg, history, opts, sampler)?;
+            history.push(chat::assistant(&followup));
+            return Ok(followup);
+        }
+    }
+    Ok(reply)
 }
 
 enum Engine {

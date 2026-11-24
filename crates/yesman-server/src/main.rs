@@ -56,7 +56,7 @@ struct Args {
     #[arg(long, default_value_t = 8000)]
     port: u16,
     /// Model id reported by /v1/models and in responses
-    #[arg(long, default_value = "qwen2.5-1.5b-instruct")]
+    #[arg(long, default_value = "Carp-1")]
     model_id: String,
     /// Default system prompt when none is provided in request
     #[arg(long)]
@@ -247,6 +247,8 @@ struct ChatRequest {
     seed: Option<u64>,
     #[serde(default)]
     stream: bool,
+    #[serde(default)]
+    tools: Option<Vec<Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -341,7 +343,31 @@ impl AppState {
         if req.messages.is_empty() {
             return Err(anyhow!("messages must not be empty"));
         }
-        let messages = build_messages(&req.messages, &self.0.system_prompt);
+        let mut messages = build_messages(&req.messages, &self.0.system_prompt);
+        if let Some(tools_vec) = &req.tools {
+            let mcp_tools: Vec<yesman_model::McpTool> = tools_vec
+                .iter()
+                .filter_map(|t| {
+                    let func = t.get("function")?;
+                    Some(yesman_model::McpTool {
+                        name: func.get("name")?.as_str()?.to_string(),
+                        description: func
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        input_schema: func
+                            .get("parameters")
+                            .cloned()
+                            .unwrap_or(json!({"type": "object", "properties": {}})),
+                    })
+                })
+                .collect();
+            if !mcp_tools.is_empty() && !messages.is_empty() {
+                messages[0].content =
+                    yesman_model::format_tools_system_prompt(&messages[0].content, &mcp_tools);
+            }
+        }
         let prompt = chat::render(&messages);
         let prompt_ids = self.0.tok.encode(&prompt)?;
         let mut stop = self.0.cfg.eos_ids();
@@ -802,6 +828,45 @@ async fn non_stream_response(state: AppState, plan: RequestPlan) -> impl IntoRes
                 .metrics
                 .record_completion(prompt_len, completion_tokens, duration_ms, is_chat);
             if is_chat {
+                let (clean_text, calls) = yesman_model::parse_tool_calls(&text);
+                let (msg, finish_reason) = if !calls.is_empty() {
+                    let tool_calls: Vec<Value> = calls
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, c)| {
+                            json!({
+                                "id": format!("call_{i}_{id}"),
+                                "type": "function",
+                                "function": {
+                                    "name": c.name,
+                                    "arguments": c.arguments.to_string(),
+                                }
+                            })
+                        })
+                        .collect();
+                    let content_val = if clean_text.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::String(clean_text)
+                    };
+                    (
+                        json!({
+                            "role": "assistant",
+                            "content": content_val,
+                            "tool_calls": tool_calls,
+                        }),
+                        "tool_calls",
+                    )
+                } else {
+                    (
+                        json!({
+                            "role": "assistant",
+                            "content": text,
+                        }),
+                        "stop",
+                    )
+                };
+
                 Json(json!({
                     "id": id,
                     "object": "chat.completion",
@@ -809,8 +874,8 @@ async fn non_stream_response(state: AppState, plan: RequestPlan) -> impl IntoRes
                     "model": model_id,
                     "choices": [{
                         "index": 0,
-                        "message": {"role": "assistant", "content": text},
-                        "finish_reason": "stop",
+                        "message": msg,
+                        "finish_reason": finish_reason,
                     }],
                     "usage": {
                         "prompt_tokens": prompt_len,
@@ -1025,7 +1090,7 @@ mod tests {
         let built = build_messages(&msgs, chat::DEFAULT_SYSTEM);
         assert_eq!(built.len(), 2);
         assert_eq!(built[0].role, "system");
-        assert_eq!(built[1].content, chat::DEFAULT_SYSTEM);
+        assert_eq!(built[0].content, chat::DEFAULT_SYSTEM);
         assert_eq!(built[1].role, "user");
         assert_eq!(built[1].content, "hi");
 

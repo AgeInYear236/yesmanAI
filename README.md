@@ -117,7 +117,7 @@ being misread (rebuild it with `--save-cache`).
 # Chat completions (OpenAI format, supports streaming via "stream": true)
 curl -s -X POST http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"qwen2.5-1.5b-instruct","temperature":0.7,"max_tokens":64,
+  -d '{"model":"Carp-1","temperature":0.7,"max_tokens":64,
        "messages":[{"role":"user","content":"What is 2+2? One word."}]}'
 
 # Legacy text completions
@@ -125,6 +125,12 @@ curl -s -X POST http://127.0.0.1:8000/v1/completions \
   -H 'Content-Type: application/json' \
   -d '{"prompt":"The capital of France is","temperature":0,"max_tokens":8}'
 
+# CLI curl-based test
+curl -s -X POST http://127.0.0.1:8000/v1/chat/completions \
+        -H 'Content-Type: application/json' \
+        -d '{"messages":[{"role":"user","content":"Heyo mate, howdy?"}]}' | jq .choices[0].message.content
+
+  
 # Telemetry & Health
 curl -s http://127.0.0.1:8000/health
 curl -s http://127.0.0.1:8000/v1/models

@@ -405,8 +405,8 @@ void rope_batched_kernel(
 
 // ----------------------------------------------------------------------------
 // Batched GEMM FP32: out[row, col] = sum(x[row, k] * w[col, k]) + (bias ? bias[col] : 0)
-// Grid: (n, m)
-// Vectorized 128-bit loads (4 floats per thread)
+// Grid: (n, m.div_ceil(16))
+// Weights are loaded ONCE and multiplied across up to 16 tokens
 // ----------------------------------------------------------------------------
 __attribute__((noinline))
 void gemm_f32_kernel(
@@ -420,41 +420,49 @@ void gemm_f32_kernel(
 ) {
     int col = 0;
     asm("mov.u32 %0, %%ctaid.x;" : "=r"(col)); // output feature 0..n-1
-    int row = 0;
-    asm("mov.u32 %0, %%ctaid.y;" : "=r"(row)); // token 0..m-1
+    int tile_y = 0;
+    asm("mov.u32 %0, %%ctaid.y;" : "=r"(tile_y));
+    int m_base = tile_y * 16;
     int lane = 0;
     asm("mov.u32 %0, %%tid.x;" : "=r"(lane));
 
-    if (col >= n || row >= m) return;
+    if (col >= n || m_base >= m) return;
 
-    float sum = 0.0f;
+    int cur_m = m - m_base;
+    if (cur_m > 16) cur_m = 16;
+
     const float* w_row = w + (long long)col * k;
-    const float* x_row = x + (long long)row * k;
-
     typedef float float4_t __attribute__((ext_vector_type(4)));
     int k4 = k / 4;
     const float4_t* w4 = (const float4_t*)w_row;
-    const float4_t* x4 = (const float4_t*)x_row;
+
+    float totals[16] = {0.0f};
 
     for (int i = lane; i < k4; i += 32) {
-        float4_t va = x4[i];
         float4_t vb = w4[i];
-        sum += va[0] * vb[0] + va[1] * vb[1] + va[2] * vb[2] + va[3] * vb[3];
+        for (int r = 0; r < cur_m; r++) {
+            const float4_t* x4_r = (const float4_t*)(x + (long long)(m_base + r) * k);
+            float4_t va = x4_r[i];
+            float dot4 = va[0] * vb[0] + va[1] * vb[1] + va[2] * vb[2] + va[3] * vb[3];
+            float sum = warp_reduce_sum(dot4);
+            if (lane == 0) {
+                totals[r] += sum;
+            }
+        }
     }
 
-    sum = warp_reduce_sum(sum);
-
     if (lane == 0) {
-        if (bias != 0) {
-            sum += bias[col];
+        float b = (bias != 0) ? bias[col] : 0.0f;
+        for (int r = 0; r < cur_m; r++) {
+            out[(long long)(m_base + r) * n + col] = totals[r] + b;
         }
-        out[(long long)row * n + col] = sum;
     }
 }
 
 // ----------------------------------------------------------------------------
 // Batched GEMM Q8_0: out[row, col] = sum(x[row, k] * w[col, k])
-// Grid: (n, m)
+// Grid: (n, m.div_ceil(16))
+// Weights are loaded ONCE and multiplied across up to 16 tokens
 // ----------------------------------------------------------------------------
 __attribute__((noinline))
 void gemm_q8_kernel(
@@ -468,41 +476,48 @@ void gemm_q8_kernel(
 ) {
     int col = 0;
     asm("mov.u32 %0, %%ctaid.x;" : "=r"(col)); // output feature 0..n-1
-    int row = 0;
-    asm("mov.u32 %0, %%ctaid.y;" : "=r"(row)); // token 0..m-1
+    int tile_y = 0;
+    asm("mov.u32 %0, %%ctaid.y;" : "=r"(tile_y));
+    int m_base = tile_y * 16;
     int lane = 0;
     asm("mov.u32 %0, %%tid.x;" : "=r"(lane));
 
-    if (col >= n || row >= m) return;
+    if (col >= n || m_base >= m) return;
+
+    int cur_m = m - m_base;
+    if (cur_m > 16) cur_m = 16;
 
     int num_blocks = k / 32;
     const unsigned char* w_row = w_blocks + (long long)col * num_blocks * 36;
-    const float* x_row = x + (long long)row * k;
 
-    float total = 0.0f;
+    float totals[16] = {0.0f};
 
     for (int b = 0; b < num_blocks; b++) {
         const unsigned char* block_ptr = w_row + b * 36;
         float d = *(const float*)block_ptr;
-        signed char q = (signed char)block_ptr[4 + lane];
-        float prod = x_row[b * 32 + lane] * (float)q;
-        float sum_b = warp_reduce_sum(prod);
-        if (lane == 0) {
-            total += d * sum_b;
+        float q = (float)((signed char)block_ptr[4 + lane]);
+
+        for (int r = 0; r < cur_m; r++) {
+            float x_val = x[(long long)(m_base + r) * k + b * 32 + lane];
+            float sum_b = warp_reduce_sum(x_val * q);
+            if (lane == 0) {
+                totals[r] += d * sum_b;
+            }
         }
     }
 
     if (lane == 0) {
-        if (bias != 0) {
-            total += bias[col];
+        float b = (bias != 0) ? bias[col] : 0.0f;
+        for (int r = 0; r < cur_m; r++) {
+            out[(long long)(m_base + r) * n + col] = totals[r] + b;
         }
-        out[(long long)row * n + col] = total;
     }
 }
 
 // ----------------------------------------------------------------------------
 // Batched GEMM Q4_K: out[row, col] = sum(x[row, k] * w[col, k])
-// Grid: (n, m)
+// Grid: (n, m.div_ceil(16))
+// Weights are loaded ONCE and multiplied across up to 16 tokens
 // ----------------------------------------------------------------------------
 __attribute__((noinline))
 void gemm_q4k_kernel(
@@ -516,18 +531,21 @@ void gemm_q4k_kernel(
 ) {
     int col = 0;
     asm("mov.u32 %0, %%ctaid.x;" : "=r"(col)); // output feature 0..n-1
-    int row = 0;
-    asm("mov.u32 %0, %%ctaid.y;" : "=r"(row)); // token 0..m-1
+    int tile_y = 0;
+    asm("mov.u32 %0, %%ctaid.y;" : "=r"(tile_y));
+    int m_base = tile_y * 16;
     int lane = 0;
     asm("mov.u32 %0, %%tid.x;" : "=r"(lane));
 
-    if (col >= n || row >= m) return;
+    if (col >= n || m_base >= m) return;
+
+    int cur_m = m - m_base;
+    if (cur_m > 16) cur_m = 16;
 
     int num_super_blocks = k / 256;
     const unsigned char* w_row = w_blocks + (long long)col * num_super_blocks * 152;
-    const float* x_row = x + (long long)row * k;
 
-    float total = 0.0f;
+    float totals[16] = {0.0f};
 
     for (int sb = 0; sb < num_super_blocks; sb++) {
         const unsigned char* sb_ptr = w_row + sb * 152;
@@ -536,33 +554,30 @@ void gemm_q4k_kernel(
         const unsigned char* scales = sb_ptr + 8;
         const unsigned char* qs = sb_ptr + 24;
 
-        const float* x_sb = x_row + sb * 256;
-
         for (int j = 0; j < 8; j++) {
             float sd = d * (float)scales[j];
             float md = dmin * ((float)scales[8 + j] - 127.0f);
 
             int byte_idx = (lane < 16) ? lane : (lane - 16);
             unsigned char raw_byte = qs[j * 16 + byte_idx];
-            int nib = (lane < 16) ? (raw_byte & 0x0f) : (raw_byte >> 4);
+            float q = (float)((lane < 16) ? (raw_byte & 0x0f) : (raw_byte >> 4));
 
-            float x_val = x_sb[j * 32 + lane];
-            float prod = x_val * (float)nib;
-
-            float sum_prod = warp_reduce_sum(prod);
-            float sum_x = warp_reduce_sum(x_val);
-
-            if (lane == 0) {
-                total += sd * sum_prod - md * sum_x;
+            for (int r = 0; r < cur_m; r++) {
+                float x_val = x[(long long)(m_base + r) * k + sb * 256 + j * 32 + lane];
+                float sum_prod = warp_reduce_sum(x_val * q);
+                float sum_x = warp_reduce_sum(x_val);
+                if (lane == 0) {
+                    totals[r] += sd * sum_prod - md * sum_x;
+                }
             }
         }
     }
 
     if (lane == 0) {
-        if (bias != 0) {
-            total += bias[col];
+        float b = (bias != 0) ? bias[col] : 0.0f;
+        for (int r = 0; r < cur_m; r++) {
+            out[(long long)(m_base + r) * n + col] = totals[r] + b;
         }
-        out[(long long)row * n + col] = total;
     }
 }
 

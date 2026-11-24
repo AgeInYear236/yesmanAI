@@ -429,11 +429,12 @@ impl CudaKernels {
             &n_i32 as *const _ as *mut _,
             &m_i32 as *const _ as *mut _,
         ];
+        let grid_m = (m as u32).div_ceil(16);
         unsafe {
             (self.ctx.driver.cuLaunchKernel)(
                 self.gemm_f32,
                 n as u32,
-                m as u32,
+                grid_m,
                 1,
                 32,
                 1,
@@ -471,11 +472,12 @@ impl CudaKernels {
             &n_i32 as *const _ as *mut _,
             &m_i32 as *const _ as *mut _,
         ];
+        let grid_m = (m as u32).div_ceil(16);
         unsafe {
             (self.ctx.driver.cuLaunchKernel)(
                 self.gemm_q8,
                 n as u32,
-                m as u32,
+                grid_m,
                 1,
                 32,
                 1,
@@ -513,11 +515,12 @@ impl CudaKernels {
             &n_i32 as *const _ as *mut _,
             &m_i32 as *const _ as *mut _,
         ];
+        let grid_m = (m as u32).div_ceil(16);
         unsafe {
             (self.ctx.driver.cuLaunchKernel)(
                 self.gemm_q4k,
                 n as u32,
-                m as u32,
+                grid_m,
                 1,
                 32,
                 1,
