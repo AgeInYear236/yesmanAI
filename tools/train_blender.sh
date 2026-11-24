@@ -11,6 +11,11 @@
 #   bash tools/train_blender.sh [--epochs 2] [--batch-size 1]
 set -euo pipefail
 
+# Ensure GPU VRAM is free before training
+pkill -x yesman-server 2>/dev/null || true
+pkill -x yesman 2>/dev/null || true
+sleep 1
+
 PYTHON=${PYTHON:-training/.venv/bin/python}
 
 if [ ! -f "$PYTHON" ]; then

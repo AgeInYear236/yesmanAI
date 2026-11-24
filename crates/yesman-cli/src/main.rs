@@ -370,34 +370,42 @@ fn handle_turn(
     sampler: &mut Sampler,
     mcp: &mut Option<yesman_model::McpClient>,
 ) -> Result<String> {
-    let reply = print_reply(engine, tok, cfg, history, opts, sampler)?;
-    history.push(chat::assistant(&reply));
+    const MAX_STEPS: usize = 5;
+    let mut step = 0;
+    #[allow(unused_assignments)]
+    let mut last_reply = String::new();
 
-    if let Some(client) = mcp {
-        let (_, calls) = yesman_model::parse_tool_calls(&reply);
-        if !calls.is_empty() {
-            for call in calls {
-                println!("\n🛠️  [Вызов инструмента MCP: {}]", call.name);
-                println!(
-                    "    Аргументы: {}",
-                    serde_json::to_string(&call.arguments).unwrap_or_default()
-                );
-                let result = match client.call_tool(&call.name, call.arguments) {
-                    Ok(res) => res,
-                    Err(e) => format!("Error executing tool {}: {e}", call.name),
-                };
-                println!("📦 [Результат]: {}\n", result.trim());
-                let tool_resp = yesman_model::format_tool_response(&result);
-                history.push(chat::user(tool_resp));
+    loop {
+        let reply = print_reply(engine, tok, cfg, history, opts, sampler)?;
+        history.push(chat::assistant(&reply));
+        last_reply = reply.clone();
+
+        if let Some(client) = mcp {
+            let (_, calls) = yesman_model::parse_tool_calls(&reply);
+            if !calls.is_empty() && step < MAX_STEPS {
+                step += 1;
+                for call in calls {
+                    println!("\n🛠️  [Вызов инструмента MCP: {}]", call.name);
+                    println!(
+                        "    Аргументы: {}",
+                        serde_json::to_string(&call.arguments).unwrap_or_default()
+                    );
+                    let result = match client.call_tool(&call.name, call.arguments) {
+                        Ok(res) => res,
+                        Err(e) => format!("Error executing tool {}: {e}", call.name),
+                    };
+                    println!("📦 [Результат]: {}\n", result.trim());
+                    let tool_resp = yesman_model::format_tool_response(&result);
+                    history.push(chat::user(tool_resp));
+                }
+                print!("💬 ");
+                continue;
             }
-            // Auto-continue generation so model explains tool result to user
-            print!("💬 ");
-            let followup = print_reply(engine, tok, cfg, history, opts, sampler)?;
-            history.push(chat::assistant(&followup));
-            return Ok(followup);
         }
+        break;
     }
-    Ok(reply)
+
+    Ok(last_reply)
 }
 
 enum Engine {

@@ -96,7 +96,7 @@ def main():
             trust_remote_code=True,
         )
     else:
-        device_map = "auto"
+        device_map = {"": 0}
         gpu_name = torch.cuda.get_device_name(0)
         vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
         print(f"CUDA device detected: {gpu_name} ({vram_gb:.2f} GB VRAM)")
