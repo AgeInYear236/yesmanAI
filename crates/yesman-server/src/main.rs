@@ -288,6 +288,44 @@ impl CompletionRequest {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct ResponsesRequest {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    input: Value,
+    #[serde(default)]
+    instructions: Option<String>,
+    #[serde(default)]
+    tools: Option<Vec<Value>>,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    max_output_tokens: Option<usize>,
+    #[serde(default)]
+    stream: bool,
+}
+
+fn extract_content_text(content: &Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|it| {
+                if let Some(t) = it.get("text").and_then(Value::as_str) {
+                    Some(t)
+                } else if let Some(t) = it.as_str() {
+                    Some(t)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        other => other.to_string(),
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct Message {
     role: String,
@@ -485,6 +523,101 @@ impl AppState {
             is_chat: false,
         })
     }
+
+    fn plan_responses(&self, req: &ResponsesRequest) -> Result<RequestPlan> {
+        let mut msgs = Vec::new();
+        let sys_text = req
+            .instructions
+            .clone()
+            .unwrap_or_else(|| self.0.system_prompt.clone());
+        msgs.push(chat::system(sys_text));
+
+        match &req.input {
+            Value::String(s) => {
+                msgs.push(chat::user(s.clone()));
+            }
+            Value::Array(items) => {
+                for item in items {
+                    if let Some(role) = item.get("role").and_then(Value::as_str) {
+                        let text =
+                            extract_content_text(item.get("content").unwrap_or(&Value::Null));
+                        msgs.push(chat::Message {
+                            role: role.to_string(),
+                            content: text,
+                        });
+                    } else if let Some(text) = item.as_str() {
+                        msgs.push(chat::user(text.to_string()));
+                    }
+                }
+            }
+            _ => {
+                msgs.push(chat::user(req.input.to_string()));
+            }
+        }
+
+        if let Some(tools_vec) = &req.tools {
+            let mcp_tools: Vec<yesman_model::McpTool> = tools_vec
+                .iter()
+                .filter_map(|t| {
+                    let name = t
+                        .get("name")
+                        .or_else(|| t.get("function").and_then(|f| f.get("name")))?;
+                    let desc = t
+                        .get("description")
+                        .or_else(|| t.get("function").and_then(|f| f.get("description")));
+                    let params = t
+                        .get("parameters")
+                        .or_else(|| t.get("function").and_then(|f| f.get("parameters")));
+                    Some(yesman_model::McpTool {
+                        name: name.as_str()?.to_string(),
+                        description: desc.and_then(Value::as_str).unwrap_or("").to_string(),
+                        input_schema: params
+                            .cloned()
+                            .unwrap_or(json!({"type": "object", "properties": {}})),
+                    })
+                })
+                .collect();
+            if !mcp_tools.is_empty() && !msgs.is_empty() {
+                msgs[0].content =
+                    yesman_model::format_tools_system_prompt(&msgs[0].content, &mcp_tools);
+            }
+        }
+
+        let prompt = chat::render(&msgs);
+        let prompt_ids = self.0.tok.encode(&prompt)?;
+        let mut stop = self.0.cfg.eos_ids();
+        if let Some(id) = self.0.tok.id_of(chat::IM_END)
+            && !stop.contains(&id)
+        {
+            stop.push(id);
+        }
+        if let Some(id) = self.0.tok.id_of("<|endoftext|>")
+            && !stop.contains(&id)
+        {
+            stop.push(id);
+        }
+        let max_ctx = self.0.ctx;
+        let opts = GenerateOptions {
+            max_new_tokens: req
+                .max_output_tokens
+                .unwrap_or(512)
+                .min(max_ctx.saturating_sub(prompt_ids.len())),
+            stop_ids: stop,
+            max_ctx,
+        };
+
+        let mut s = Sampler::new(rand_u64());
+        s.temperature = req.temperature.unwrap_or(0.7);
+
+        Ok(RequestPlan {
+            prompt_ids,
+            opts,
+            sampler: s,
+            id: format!("resp-{}", self.0.seq.fetch_add(1, Ordering::Relaxed)),
+            model_id: req.model.clone().unwrap_or_else(|| self.0.model_id.clone()),
+            is_chat: true,
+        })
+    }
 }
 
 fn rand_u64() -> u64 {
@@ -611,6 +744,8 @@ async fn main() -> Result<()> {
         .route("/chat/completions", post(chat_completions))
         .route("/v1/completions", post(text_completions))
         .route("/completions", post(text_completions))
+        .route("/v1/responses", post(responses_endpoint))
+        .route("/responses", post(responses_endpoint))
         .route("/metrics", get(metrics_handler))
         .route("/stats", get(stats_handler))
         .fallback(fallback_handler)
@@ -802,6 +937,21 @@ async fn text_completions(
         Ok(non_stream_response(state, plan).await.into_response())
     } else {
         Ok(stream_response(state, plan).await.into_response())
+    }
+}
+
+async fn responses_endpoint(
+    State(state): State<AppState>,
+    Json(req): Json<ResponsesRequest>,
+) -> Result<impl IntoResponse, impl IntoResponse> {
+    let plan = match state.plan_responses(&req) {
+        Ok(p) => p,
+        Err(e) => return Err(error_response(e)),
+    };
+    if !req.stream {
+        Ok(non_stream_responses(state, plan).await.into_response())
+    } else {
+        Ok(stream_responses(state, plan).await.into_response())
     }
 }
 
@@ -1081,6 +1231,337 @@ async fn stream_response(state: AppState, plan: RequestPlan) -> impl IntoRespons
             );
         }
         yield Ok::<Event, Infallible>(Event::default().data("[DONE]"));
+    };
+
+    Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
+}
+
+async fn non_stream_responses(state: AppState, plan: RequestPlan) -> impl IntoResponse {
+    let RequestPlan {
+        prompt_ids,
+        opts,
+        sampler,
+        id,
+        model_id,
+        ..
+    } = plan;
+    let prompt_len = prompt_ids.len();
+
+    let (session, permit) = match state.0.pool.acquire().await {
+        Ok(pair) => pair,
+        Err(e) => return error_response(e).into_response(),
+    };
+    state
+        .0
+        .metrics
+        .active_requests
+        .fetch_add(1, Ordering::Relaxed);
+    let worker_state = state.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let t_start = Instant::now();
+        let mut session = session;
+        let mut sampler = sampler;
+        let res: Result<(Vec<u32>, String)> = session.generate(
+            &worker_state.0.tok,
+            &prompt_ids,
+            &opts,
+            &mut sampler,
+            |_| Ok(()),
+        );
+        let duration_ms = t_start.elapsed().as_millis() as u64;
+        worker_state.0.pool.release(session, permit);
+        res.map(|(ids, text)| (ids.len(), text, duration_ms))
+    })
+    .await;
+
+    state
+        .0
+        .metrics
+        .active_requests
+        .fetch_sub(1, Ordering::Relaxed);
+
+    match result {
+        Ok(Ok((completion_tokens, text, duration_ms))) => {
+            state
+                .0
+                .metrics
+                .record_completion(prompt_len, completion_tokens, duration_ms, true);
+            let (clean_text, calls) = yesman_model::parse_tool_calls(&text);
+            let output_items = if !calls.is_empty() {
+                calls
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        json!({
+                            "id": format!("call_{i}_{id}"),
+                            "type": "function_call",
+                            "call_id": format!("call_{i}_{id}"),
+                            "name": c.name,
+                            "arguments": c.arguments.to_string(),
+                        })
+                    })
+                    .collect()
+            } else {
+                vec![json!({
+                    "id": format!("msg_{id}"),
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{
+                        "type": "output_text",
+                        "text": clean_text,
+                        "annotations": []
+                    }]
+                })]
+            };
+
+            Json(json!({
+                "id": id,
+                "object": "response",
+                "type": "response",
+                "created_at": now_secs(),
+                "status": "completed",
+                "model": model_id,
+                "output": output_items,
+                "usage": {
+                    "input_tokens": prompt_len,
+                    "output_tokens": completion_tokens,
+                    "total_tokens": prompt_len + completion_tokens
+                }
+            }))
+            .into_response()
+        }
+        Ok(Err(e)) => error_response(e).into_response(),
+        Err(e) => error_response(anyhow!("worker panicked: {e}")).into_response(),
+    }
+}
+
+async fn stream_responses(state: AppState, plan: RequestPlan) -> impl IntoResponse {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+    let id = plan.id.clone();
+    let model_id = plan.model_id.clone();
+    let prompt_len = plan.prompt_ids.len();
+    let created = now_secs();
+
+    let (session, permit) = match state.0.pool.acquire().await {
+        Ok(pair) => pair,
+        Err(e) => return error_response(e).into_response(),
+    };
+    state
+        .0
+        .metrics
+        .active_requests
+        .fetch_add(1, Ordering::Relaxed);
+    let worker_state = state.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let t_start = Instant::now();
+        let mut session = session;
+        let mut sampler = plan.sampler;
+        let mut count = 0usize;
+        let res: Result<(Vec<u32>, String)> = session.generate(
+            &worker_state.0.tok,
+            &plan.prompt_ids,
+            &plan.opts,
+            &mut sampler,
+            |piece| {
+                count += 1;
+                let _ = tx.blocking_send(piece.to_string());
+                Ok(())
+            },
+        );
+        let duration_ms = t_start.elapsed().as_millis() as u64;
+        worker_state
+            .0
+            .metrics
+            .record_completion(prompt_len, count, duration_ms, true);
+        worker_state
+            .0
+            .metrics
+            .active_requests
+            .fetch_sub(1, Ordering::Relaxed);
+        worker_state.0.pool.release(session, permit);
+        if let Err(e) = res {
+            let _ = tx.blocking_send(format!("\u{0}ERROR:{e}"));
+        }
+    });
+
+    let stream = async_stream::stream! {
+        let mut seq = 0u64;
+        yield Ok::<Event, Infallible>(
+            Event::default()
+                .event("response.created")
+                .data(
+                    json!({
+                        "type": "response.created",
+                        "response": {
+                            "id": id,
+                            "object": "response",
+                            "created_at": created,
+                            "status": "in_progress",
+                            "model": model_id,
+                            "output": [],
+                            "error": Value::Null,
+                            "usage": Value::Null,
+                        },
+                        "sequence_number": seq,
+                    })
+                    .to_string(),
+                ),
+        );
+        seq += 1;
+
+        let msg_id = format!("msg_{id}");
+        yield Ok::<Event, Infallible>(
+            Event::default()
+                .event("response.output_item.added")
+                .data(
+                    json!({
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": {
+                            "id": msg_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "status": "in_progress",
+                            "content": []
+                        },
+                        "sequence_number": seq,
+                    })
+                    .to_string(),
+                ),
+        );
+        seq += 1;
+
+        yield Ok::<Event, Infallible>(
+            Event::default()
+                .event("response.content_part.added")
+                .data(
+                    json!({
+                        "type": "response.content_part.added",
+                        "item_id": msg_id,
+                        "output_index": 0,
+                        "content_index": 0,
+                        "part": {
+                            "type": "output_text",
+                            "text": "",
+                            "annotations": []
+                        },
+                        "sequence_number": seq,
+                    })
+                    .to_string(),
+                ),
+        );
+        seq += 1;
+
+        let mut full_text = String::new();
+        while let Some(piece) = rx.recv().await {
+            if let Some(msg) = piece.strip_prefix("\u{0}ERROR:") {
+                yield Ok::<Event, Infallible>(
+                    Event::default()
+                        .event("error")
+                        .data(json!({"error": {"message": msg}}).to_string()),
+                );
+                break;
+            }
+            full_text.push_str(&piece);
+            yield Ok::<Event, Infallible>(
+                Event::default()
+                    .event("response.output_text.delta")
+                    .data(
+                        json!({
+                            "type": "response.output_text.delta",
+                            "item_id": msg_id,
+                            "output_index": 0,
+                            "content_index": 0,
+                            "delta": piece,
+                            "sequence_number": seq,
+                        })
+                        .to_string(),
+                    ),
+            );
+            seq += 1;
+        }
+
+        yield Ok::<Event, Infallible>(
+            Event::default()
+                .event("response.output_text.done")
+                .data(
+                    json!({
+                        "type": "response.output_text.done",
+                        "item_id": msg_id,
+                        "output_index": 0,
+                        "content_index": 0,
+                        "text": full_text,
+                        "sequence_number": seq,
+                    })
+                    .to_string(),
+                ),
+        );
+        seq += 1;
+
+        yield Ok::<Event, Infallible>(
+            Event::default()
+                .event("response.output_item.done")
+                .data(
+                    json!({
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": {
+                            "id": msg_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [{
+                                "type": "output_text",
+                                "text": full_text,
+                                "annotations": []
+                            }]
+                        },
+                        "sequence_number": seq,
+                    })
+                    .to_string(),
+                ),
+        );
+        seq += 1;
+
+        yield Ok::<Event, Infallible>(
+            Event::default()
+                .event("response.completed")
+                .data(
+                    json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": id,
+                            "object": "response",
+                            "created_at": created,
+                            "status": "completed",
+                            "model": model_id,
+                            "output": [{
+                                "id": msg_id,
+                                "type": "message",
+                                "role": "assistant",
+                                "status": "completed",
+                                "content": [{
+                                    "type": "output_text",
+                                    "text": full_text,
+                                    "annotations": []
+                                }]
+                            }],
+                            "usage": {
+                                "input_tokens": prompt_len,
+                                "output_tokens": seq,
+                                "total_tokens": prompt_len + seq as usize
+                            }
+                        },
+                        "sequence_number": seq,
+                    })
+                    .to_string(),
+                ),
+        );
     };
 
     Sse::new(stream)
