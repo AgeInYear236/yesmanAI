@@ -102,10 +102,10 @@ def main():
         device_map=device_map,
         trust_remote_code=True,
     )
-        try:
-            model.activation_checkpointing_enable()
-        except AttributeError:
-            model.gradient_checkpointing_enable()
+    try:
+        model.activation_checkpointing_enable()
+    except AttributeError:
+        model.gradient_checkpointing_enable()
 
     print(f"Setting up LoRA (r={args.lora_r}, alpha={args.lora_alpha})...")
     lora_config = LoraConfig(
