@@ -6,3 +6,6 @@
 *.ymq
 __pycache__/
 *.pyc
+.venv/
+training/.venv/
+training/output/

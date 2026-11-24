@@ -129,12 +129,34 @@ Checked: bf16-логиты совпадают с независимым numpy-э
   - Собственный парсер `GgufFile` в `yesman-core` без внешних библиотек (заголовок, метаданные, типы F32/F16/BF16/Q8_0/Q4_0, выравнивание, zero-copy mmap).
   - Поддержка прямой загрузки моделей из `.gguf` файлов (`Qwen2::from_gguf`) в CLI и сервере: `./target/release/yesman --model model.gguf`.
   - Успешная валидация в тестах (`gguf_forward_matches_safetensors`).
+- [x] **OpenAI `tools` / function-calling**:
+  - Поддержка параметра `tools` в `/v1/chat/completions`.
+  - Автоматическое форматирование в ChatML `<tools>` и парсинг `<tool_call>` с возвратом `tool_calls: [...]`.
 - [ ] Отдельная команда `yesman convert --dtype q4km --out model.ymq` вместо
   флага `--save-cache` у генерации.
-- [ ] OpenAI `tools`/function-calling, `/v1/embeddings` (embed_tokens уже есть).
+- [ ] OpenAI `/v1/embeddings` (embed_tokens уже есть).
 - [ ] Релизные профили под AVX2 / AVX-512, `cargo dist`/binaries, CHANGELOG.
 - [ ] Убрать транзитивную C-зависимость `onig_sys` (regex в `tokenizers`),
   перейдя на `fancy-regex` — тогда рантайм станет 100% Rust даже по зависимостям.
+
+---
+
+## P4 — Специализация под Blender MCP (в процессе)
+
+- [x] **Клиент MCP и агентный цикл (`crates/yesman-model/src/mcp.rs`)**:
+  - Прямой JSON-RPC 2.0 клиент по stdio для общения с любым MCP-сервером.
+  - Автоматическое подключение к Blender MCP (`--blender` в CLI).
+  - Чтение и маппинг 22 инструментов (`execute_blender_code`, `get_scene_info`, `get_object_info`, `get_viewport_screenshot`, `set_texture`).
+  - Перехват вызовов `<tool_call>`, выполнение в Blender и обратная передача `<tool_response>` в контекст.
+- [x] **Пайплайн данных для дообучения (`training/prepare_dataset.py`)**:
+  - Извлечение реальных рабочих `bpy`-скриптов из открытых датасетов Hugging Face (`ShiminZ/blender-lowpoly-dioramas`, `EPM-Blender.PromptPairs`).
+  - Дополнение синтетическими парами на русском и английском (создание геометрии, шейдеры Principled BSDF, свет, камера, модификаторы, инспекция сцены).
+  - Экспорт в `train.jsonl` и `val.jsonl` в формате ChatML с секциями `<tools>` и `<tool_call>`.
+- [x] **Скрипт LoRA-обучения под 6 ГБ VRAM (`training/train_lora.py`)**:
+  - Оптимизированный QLoRA пайплайн с gradient checkpointing (расход VRAM < 4 ГБ).
+  - Слияние LoRA-адаптера с базовой моделью и экспорт в `model.safetensors`.
+  - Автоматическая сборка чистого Rust-кэша `.ymq` для инференса на GPU/CPU со скоростью 22 tok/s.
+- [ ] Обучение LoRA на собранном корпусе и валидация в живом Blender.
 
 ---
 
