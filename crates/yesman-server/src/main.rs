@@ -579,7 +579,7 @@ impl AppState {
         }
 
         if let Some(tools_vec) = &req.tools {
-            let mcp_tools: Vec<yesman_model::McpTool> = tools_vec
+            let mut mcp_tools: Vec<yesman_model::McpTool> = tools_vec
                 .iter()
                 .filter_map(|t| {
                     let name = t
@@ -610,6 +610,25 @@ impl AppState {
                     })
                 })
                 .collect();
+
+            // If OpenCode only provided generic 'execute'/'opencode' tools without blender tools,
+            // inject the real 'execute_blender_code' tool so the model knows what to call!
+            if !mcp_tools.iter().any(|t| t.name.contains("blender")) {
+                mcp_tools.push(yesman_model::McpTool {
+                    name: "execute_blender_code".to_string(),
+                    description: "Execute arbitrary Python code in Blender via the bpy API".to_string(),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "code": {
+                                "type": "string",
+                                "description": "Python code using bpy"
+                            }
+                        },
+                        "required": ["code"]
+                    }),
+                });
+            }
             if !mcp_tools.is_empty() && !msgs.is_empty() {
                 msgs[0].content =
                     yesman_model::format_tools_system_prompt(&msgs[0].content, &mcp_tools);
@@ -1457,49 +1476,6 @@ async fn stream_responses(state: AppState, plan: RequestPlan) -> impl IntoRespon
         );
         seq += 1;
 
-        let msg_id = format!("msg_{id}");
-        yield Ok::<Event, Infallible>(
-            Event::default()
-                .event("response.output_item.added")
-                .data(
-                    json!({
-                        "type": "response.output_item.added",
-                        "output_index": 0,
-                        "item": {
-                            "id": msg_id,
-                            "type": "message",
-                            "role": "assistant",
-                            "status": "in_progress",
-                            "content": []
-                        },
-                        "sequence_number": seq,
-                    })
-                    .to_string(),
-                ),
-        );
-        seq += 1;
-
-        yield Ok::<Event, Infallible>(
-            Event::default()
-                .event("response.content_part.added")
-                .data(
-                    json!({
-                        "type": "response.content_part.added",
-                        "item_id": msg_id,
-                        "output_index": 0,
-                        "content_index": 0,
-                        "part": {
-                            "type": "output_text",
-                            "text": "",
-                            "annotations": []
-                        },
-                        "sequence_number": seq,
-                    })
-                    .to_string(),
-                ),
-        );
-        seq += 1;
-
         let mut full_text = String::new();
         while let Some(piece) = rx.recv().await {
             if let Some(msg) = piece.strip_prefix("\u{0}ERROR:") {
@@ -1511,6 +1487,126 @@ async fn stream_responses(state: AppState, plan: RequestPlan) -> impl IntoRespon
                 break;
             }
             full_text.push_str(&piece);
+        }
+
+        let (clean_text, calls) = yesman_model::parse_tool_calls(&full_text);
+
+        if !calls.is_empty() {
+            for (i, c) in calls.into_iter().enumerate() {
+                let call_id = format!("call_{i}_{id}");
+                yield Ok::<Event, Infallible>(
+                    Event::default()
+                        .event("response.output_item.added")
+                        .data(
+                            json!({
+                                "type": "response.output_item.added",
+                                "output_index": i,
+                                "item": {
+                                    "id": call_id,
+                                    "type": "function_call",
+                                    "call_id": call_id,
+                                    "name": c.name,
+                                    "arguments": c.arguments.to_string(),
+                                    "status": "completed",
+                                },
+                                "sequence_number": seq,
+                            })
+                            .to_string(),
+                        ),
+                );
+                seq += 1;
+
+                yield Ok::<Event, Infallible>(
+                    Event::default()
+                        .event("response.output_item.done")
+                        .data(
+                            json!({
+                                "type": "response.output_item.done",
+                                "output_index": i,
+                                "item": {
+                                    "id": call_id,
+                                    "type": "function_call",
+                                    "call_id": call_id,
+                                    "name": c.name,
+                                    "arguments": c.arguments.to_string(),
+                                    "status": "completed",
+                                },
+                                "sequence_number": seq,
+                            })
+                            .to_string(),
+                        ),
+                );
+                seq += 1;
+            }
+
+            yield Ok::<Event, Infallible>(
+                Event::default()
+                    .event("response.completed")
+                    .data(
+                        json!({
+                            "type": "response.completed",
+                            "response": {
+                                "id": id,
+                                "object": "response",
+                                "created_at": created,
+                                "status": "completed",
+                                "model": model_id,
+                                "output": [],
+                                "usage": {
+                                    "input_tokens": prompt_len,
+                                    "output_tokens": seq,
+                                    "total_tokens": prompt_len + seq as usize
+                                }
+                            },
+                            "sequence_number": seq,
+                        })
+                        .to_string(),
+                    ),
+            );
+        } else {
+            let msg_id = format!("msg_{id}");
+            yield Ok::<Event, Infallible>(
+                Event::default()
+                    .event("response.output_item.added")
+                    .data(
+                        json!({
+                            "type": "response.output_item.added",
+                            "output_index": 0,
+                            "item": {
+                                "id": msg_id,
+                                "type": "message",
+                                "role": "assistant",
+                                "status": "in_progress",
+                                "content": []
+                            },
+                            "sequence_number": seq,
+                        })
+                        .to_string(),
+                    ),
+            );
+            seq += 1;
+
+            yield Ok::<Event, Infallible>(
+                Event::default()
+                    .event("response.content_part.added")
+                    .data(
+                        json!({
+                            "type": "response.content_part.added",
+                            "item_id": msg_id,
+                            "output_index": 0,
+                            "content_index": 0,
+                            "part": {
+                                "type": "output_text",
+                                "text": "",
+                                "annotations": []
+                            },
+                            "sequence_number": seq,
+                        })
+                        .to_string(),
+                    ),
+            );
+            seq += 1;
+
             yield Ok::<Event, Infallible>(
                 Event::default()
                     .event("response.output_text.delta")
@@ -1520,91 +1616,91 @@ async fn stream_responses(state: AppState, plan: RequestPlan) -> impl IntoRespon
                             "item_id": msg_id,
                             "output_index": 0,
                             "content_index": 0,
-                            "delta": piece,
+                            "delta": clean_text,
                             "sequence_number": seq,
                         })
                         .to_string(),
                     ),
             );
             seq += 1;
-        }
 
-        yield Ok::<Event, Infallible>(
-            Event::default()
-                .event("response.output_text.done")
-                .data(
-                    json!({
-                        "type": "response.output_text.done",
-                        "item_id": msg_id,
-                        "output_index": 0,
-                        "content_index": 0,
-                        "text": full_text,
-                        "sequence_number": seq,
-                    })
-                    .to_string(),
-                ),
-        );
-        seq += 1;
+            yield Ok::<Event, Infallible>(
+                Event::default()
+                    .event("response.output_text.done")
+                    .data(
+                        json!({
+                            "type": "response.output_text.done",
+                            "item_id": msg_id,
+                            "output_index": 0,
+                            "content_index": 0,
+                            "text": clean_text,
+                            "sequence_number": seq,
+                        })
+                        .to_string(),
+                    ),
+            );
+            seq += 1;
 
-        yield Ok::<Event, Infallible>(
-            Event::default()
-                .event("response.output_item.done")
-                .data(
-                    json!({
-                        "type": "response.output_item.done",
-                        "output_index": 0,
-                        "item": {
-                            "id": msg_id,
-                            "type": "message",
-                            "role": "assistant",
-                            "status": "completed",
-                            "content": [{
-                                "type": "output_text",
-                                "text": full_text,
-                                "annotations": []
-                            }]
-                        },
-                        "sequence_number": seq,
-                    })
-                    .to_string(),
-                ),
-        );
-        seq += 1;
-
-        yield Ok::<Event, Infallible>(
-            Event::default()
-                .event("response.completed")
-                .data(
-                    json!({
-                        "type": "response.completed",
-                        "response": {
-                            "id": id,
-                            "object": "response",
-                            "created_at": created,
-                            "status": "completed",
-                            "model": model_id,
-                            "output": [{
+            yield Ok::<Event, Infallible>(
+                Event::default()
+                    .event("response.output_item.done")
+                    .data(
+                        json!({
+                            "type": "response.output_item.done",
+                            "output_index": 0,
+                            "item": {
                                 "id": msg_id,
                                 "type": "message",
                                 "role": "assistant",
                                 "status": "completed",
                                 "content": [{
                                     "type": "output_text",
-                                    "text": full_text,
+                                    "text": clean_text,
                                     "annotations": []
                                 }]
-                            }],
-                            "usage": {
-                                "input_tokens": prompt_len,
-                                "output_tokens": seq,
-                                "total_tokens": prompt_len + seq as usize
-                            }
-                        },
-                        "sequence_number": seq,
-                    })
-                    .to_string(),
-                ),
-        );
+                            },
+                            "sequence_number": seq,
+                        })
+                        .to_string(),
+                    ),
+            );
+            seq += 1;
+
+            yield Ok::<Event, Infallible>(
+                Event::default()
+                    .event("response.completed")
+                    .data(
+                        json!({
+                            "type": "response.completed",
+                            "response": {
+                                "id": id,
+                                "object": "response",
+                                "created_at": created,
+                                "status": "completed",
+                                "model": model_id,
+                                "output": [{
+                                    "id": msg_id,
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "status": "completed",
+                                    "content": [{
+                                        "type": "output_text",
+                                        "text": clean_text,
+                                        "annotations": []
+                                    }]
+                                }],
+                                "usage": {
+                                    "input_tokens": prompt_len,
+                                    "output_tokens": seq,
+                                    "total_tokens": prompt_len + seq as usize
+                                }
+                            },
+                            "sequence_number": seq,
+                        })
+                        .to_string(),
+                    ),
+            );
+        }
     };
 
     Sse::new(stream)
