@@ -27,14 +27,15 @@ struct Args {
     device: String,
 
     /// Context window for the KV cache
-    #[arg(long, default_value_t = 4096)]
+    #[arg(long, default_value_t = 8192)]
     ctx: usize,
 
     /// One-shot prompt; omit for an interactive chat
     #[arg(short, long)]
     prompt: Option<String>,
 
-    #[arg(long, default_value_t = 512)]
+    /// Max tokens per assistant turn (a detailed bpy script + plan is ~2.5k).
+    #[arg(long, default_value_t = 3072)]
     max_tokens: usize,
 
     #[arg(long)]
@@ -83,11 +84,11 @@ struct Args {
     #[arg(long)]
     perplexity: Option<PathBuf>,
 
-    /// Connect to an MCP server via stdio command (e.g. "op-blender-mcp")
+    /// Connect to an MCP server via stdio command (e.g. "uvx mcp-for-blender")
     #[arg(long)]
     mcp: Option<String>,
 
-    /// Auto-connect to local Blender MCP server
+    /// Auto-connect to local Blender MCP server (mcp-for-blender)
     #[arg(long)]
     blender: bool,
 }
@@ -255,12 +256,7 @@ fn main() -> Result<()> {
     };
 
     let mut mcp_client = if args.blender {
-        let venv_cmd = "/home/zj/Prog/op-blender-mcp/.venv/bin/op-blender-mcp";
-        let default_cmd = if std::path::Path::new(venv_cmd).exists() {
-            venv_cmd
-        } else {
-            "op-blender-mcp"
-        };
+        let default_cmd = "uvx mcp-for-blender";
         eprintln!("connecting to Blender MCP server ({default_cmd})...");
         Some(yesman_model::McpClient::spawn(default_cmd)?)
     } else if let Some(cmd) = &args.mcp {
@@ -272,32 +268,34 @@ fn main() -> Result<()> {
 
     let system_prompt = if let Some(client) = &mut mcp_client {
         let all_tools = client.list_tools()?;
-        let tools: Vec<yesman_model::McpTool> = if args.blender {
-            all_tools
-                .into_iter()
-                .filter(|t| {
-                    t.name.contains("blender")
-                        || t.name.contains("scene")
-                        || t.name.contains("object")
-                        || t.name.contains("viewport")
-                        || t.name.contains("texture")
-                })
-                .collect()
-        } else {
-            all_tools
-        };
         eprintln!(
             "loaded {} tools from MCP server: {}",
-            tools.len(),
-            tools
+            all_tools.len(),
+            all_tools
                 .iter()
                 .map(|t| t.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        let base_sys = args.system.clone().unwrap_or_else(|| {
-            "Ты — добрый, простой и отзывчивый помощник для работы в Blender. Общайся тепло, дружелюбно и живо, без заумных слов. Используй доступные инструменты Blender для выполнения запросов пользователя.".to_string()
-        });
+        // Show the model only the compact schemas it was fine-tuned on. All
+        // live tools remain callable by name; this keeps the prompt short and
+        // identical to training (the full schemas cost ~5k tokens of prefill).
+        let tools: Vec<yesman_model::McpTool> = if args.blender {
+            eprintln!("using 4 compact Blender tool schemas for the system prompt");
+            yesman_model::blender_training_tools()
+        } else {
+            all_tools
+        };
+        // The workflow rules live in one place (training/system_prompt.txt),
+        // the same text the model was fine-tuned on. Tool schemas come from
+        // the live MCP server, so training and inference stay in sync.
+        let default_rules = std::fs::read_to_string("training/system_prompt.txt")
+            .unwrap_or_else(|_| {
+                "Ты — профессиональный 3D-моделлер Blender через mcp-for-blender.".to_string()
+            })
+            .trim_end()
+            .to_string();
+        let base_sys = args.system.clone().unwrap_or(default_rules);
         yesman_model::format_tools_system_prompt(&base_sys, &tools)
     } else {
         args.system
@@ -370,8 +368,10 @@ fn handle_turn(
     sampler: &mut Sampler,
     mcp: &mut Option<yesman_model::McpClient>,
 ) -> Result<String> {
-    const MAX_STEPS: usize = 5;
+    // plan -> build -> verify (look) -> summary, with headroom for one retry.
+    const MAX_STEPS: usize = 6;
     let mut step = 0;
+    let mut consecutive_failures = 0usize;
     #[allow(unused_assignments)]
     let mut last_reply = String::new();
 
@@ -384,7 +384,20 @@ fn handle_turn(
             let (_, calls) = yesman_model::parse_tool_calls(&reply);
             if !calls.is_empty() && step < MAX_STEPS {
                 step += 1;
+
                 for call in calls {
+                    // Skip invalid empty tool calls
+                    if call.name == "execute_blender_code"
+                        && call
+                            .arguments
+                            .get("code")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.trim().is_empty())
+                            .unwrap_or(true)
+                    {
+                        continue;
+                    }
+
                     println!("\n🛠️  [Вызов инструмента MCP: {}]", call.name);
                     println!(
                         "    Аргументы: {}",
@@ -395,9 +408,28 @@ fn handle_turn(
                         Err(e) => format!("Error executing tool {}: {e}", call.name),
                     };
                     println!("📦 [Результат]: {}\n", result.trim());
+
+                    if result.contains("Error") || result.contains("validation error") {
+                        consecutive_failures += 1;
+                    } else {
+                        consecutive_failures = 0;
+                    }
+
                     let tool_resp = yesman_model::format_tool_response(&result);
                     history.push(chat::user(tool_resp));
                 }
+
+                // Two failed calls in a row mean the model is stuck in a retry
+                // loop (e.g. bad argument shapes). Stop instead of burning
+                // minutes of prefill on the same mistake.
+                if consecutive_failures >= 2 {
+                    println!("⚠️  [Инструмент дважды вернул ошибку — останавливаю цикл]");
+                    break;
+                }
+
+                // Do not stop after a successful build: the model is trained to
+                // verify with `look` and then write a final summary. The loop
+                // ends when a reply contains no tool calls.
                 print!("💬 ");
                 continue;
             }

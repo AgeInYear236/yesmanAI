@@ -430,7 +430,7 @@ impl AppState {
         let opts = GenerateOptions {
             max_new_tokens: req
                 .max_tokens
-                .unwrap_or(512)
+                .unwrap_or(3072)
                 .min(max_ctx.saturating_sub(prompt_ids.len()))
                 .max(16),
             stop_ids: stop,
@@ -511,7 +511,7 @@ impl AppState {
         let opts = GenerateOptions {
             max_new_tokens: req
                 .max_tokens
-                .unwrap_or(512)
+                .unwrap_or(3072)
                 .min(max_ctx.saturating_sub(prompt_ids.len()))
                 .max(16),
             stop_ids: stop,
@@ -579,55 +579,80 @@ impl AppState {
         }
 
         if let Some(tools_vec) = &req.tools {
-            let mut mcp_tools: Vec<yesman_model::McpTool> = tools_vec
-                .iter()
-                .filter_map(|t| {
-                    let name = t
-                        .get("name")
-                        .or_else(|| t.get("function").and_then(|f| f.get("name")))?;
-                    let name_str = name.as_str()?;
-                    // Keep Blender tools
-                    let is_blender = name_str.contains("blender")
-                        || name_str.contains("scene")
-                        || name_str.contains("object")
-                        || name_str.contains("viewport")
-                        || name_str.contains("look");
-                    if !is_blender && tools_vec.len() > 5 {
-                        return None;
-                    }
-                    let desc = t
-                        .get("description")
-                        .or_else(|| t.get("function").and_then(|f| f.get("description")));
-                    let params = t
-                        .get("parameters")
-                        .or_else(|| t.get("function").and_then(|f| f.get("parameters")));
-                    Some(yesman_model::McpTool {
-                        name: name.as_str()?.to_string(),
-                        description: desc.and_then(Value::as_str).unwrap_or("").to_string(),
-                        input_schema: params
-                            .cloned()
-                            .unwrap_or(json!({"type": "object", "properties": {}})),
-                    })
-                })
-                .collect();
+            let mut mcp_tools = Vec::new();
 
-            // If OpenCode only provided generic 'execute'/'opencode' tools without blender tools,
-            // inject the real 'execute_blender_code' tool so the model knows what to call!
-            if !mcp_tools.iter().any(|t| t.name.contains("blender")) {
+            // Check if client expects Code Mode (execute tool with JS) or direct tools
+            let has_execute_tool = tools_vec.iter().any(|t| {
+                t.get("name").and_then(Value::as_str) == Some("execute")
+                    || t.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str)
+                        == Some("execute")
+            });
+
+            if has_execute_tool {
+                // Client is OpenCode Code Mode: provide the 'execute' tool expected by OpenCode!
                 mcp_tools.push(yesman_model::McpTool {
-                    name: "execute_blender_code".to_string(),
-                    description: "Execute arbitrary Python code in Blender via the bpy API".to_string(),
+                    name: "execute".to_string(),
+                    description: "Run JavaScript code in OpenCode Code Mode. To run Blender Python code, call: await tools.blender.execute_blender_code({ code: 'import bpy...' })".to_string(),
                     input_schema: json!({
                         "type": "object",
                         "properties": {
                             "code": {
                                 "type": "string",
-                                "description": "Python code using bpy"
+                                "description": "JavaScript code to execute"
                             }
                         },
                         "required": ["code"]
                     }),
                 });
+            } else {
+                // Direct MCP tools
+                for t in tools_vec {
+                    let name = t
+                        .get("name")
+                        .or_else(|| t.get("function").and_then(|f| f.get("name")));
+                    if let Some(name_str) = name.and_then(Value::as_str) {
+                        let is_blender = name_str != "set_texture"
+                            && (name_str.contains("blender")
+                                || name_str.contains("scene")
+                                || name_str.contains("object")
+                                || name_str.contains("viewport")
+                                || name_str.contains("look"));
+                        if is_blender {
+                            let desc = t
+                                .get("description")
+                                .or_else(|| t.get("function").and_then(|f| f.get("description")));
+                            let params = t
+                                .get("parameters")
+                                .or_else(|| t.get("function").and_then(|f| f.get("parameters")));
+                            mcp_tools.push(yesman_model::McpTool {
+                                name: name_str.to_string(),
+                                description: desc.and_then(Value::as_str).unwrap_or("").to_string(),
+                                input_schema: params
+                                    .cloned()
+                                    .unwrap_or(json!({"type": "object", "properties": {}})),
+                            });
+                        }
+                    }
+                }
+                if mcp_tools.is_empty() {
+                    mcp_tools.push(yesman_model::McpTool {
+                        name: "execute_blender_code".to_string(),
+                        description: "Execute arbitrary Python code in Blender via the bpy API"
+                            .to_string(),
+                        input_schema: json!({
+                            "type": "object",
+                            "properties": {
+                                "code": {
+                                    "type": "string",
+                                    "description": "Python code using bpy"
+                                }
+                            },
+                            "required": ["code"]
+                        }),
+                    });
+                }
             }
             if !mcp_tools.is_empty() && !msgs.is_empty() {
                 msgs[0].content =
@@ -659,7 +684,7 @@ impl AppState {
         let opts = GenerateOptions {
             max_new_tokens: req
                 .max_output_tokens
-                .unwrap_or(512)
+                .unwrap_or(3072)
                 .min(max_ctx.saturating_sub(prompt_ids.len()))
                 .max(16),
             stop_ids: stop,
@@ -777,10 +802,13 @@ async fn main() -> Result<()> {
         args.max_concurrency, args.ctx
     );
 
-    let system_prompt = args
-        .system
-        .clone()
-        .unwrap_or_else(|| chat::DEFAULT_SYSTEM.to_string());
+    // Use the Blender workflow rules the model was fine-tuned on. The live
+    // tool schemas are appended per request by `format_tools_system_prompt`.
+    let default_rules = std::fs::read_to_string("training/system_prompt.txt")
+        .unwrap_or_else(|_| chat::DEFAULT_SYSTEM.to_string())
+        .trim_end()
+        .to_string();
+    let system_prompt = args.system.clone().unwrap_or(default_rules);
 
     let state = AppState(Arc::new(Inner {
         pool,
@@ -1352,33 +1380,37 @@ async fn non_stream_responses(state: AppState, plan: RequestPlan) -> impl IntoRe
             let (clean_text, calls) = yesman_model::parse_tool_calls(&text);
             eprintln!("RAW GENERATED TEXT: {text:?}");
             eprintln!("PARSED CALLS: {calls:?}");
-            let output_items = if !calls.is_empty() {
-                calls
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, c)| {
-                        json!({
-                            "id": format!("call_{i}_{id}"),
-                            "type": "function_call",
-                            "call_id": format!("call_{i}_{id}"),
-                            "name": c.name,
-                            "arguments": c.arguments.to_string(),
-                        })
+            // Keep the plan/status text visible even when the turn contains
+            // tool calls: previously it was discarded and the client could not
+            // tell what the model was about to build.
+            let plan_item = json!({
+                "id": format!("msg_{id}"),
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{
+                    "type": "output_text",
+                    "text": clean_text,
+                    "annotations": []
+                }]
+            });
+            let mut output_items: Vec<Value> = Vec::new();
+            if !clean_text.is_empty() {
+                output_items.push(plan_item.clone());
+            }
+            if !calls.is_empty() {
+                output_items.extend(calls.into_iter().enumerate().map(|(i, c)| {
+                    json!({
+                        "id": format!("call_{i}_{id}"),
+                        "type": "function_call",
+                        "call_id": format!("call_{i}_{id}"),
+                        "name": c.name,
+                        "arguments": c.arguments.to_string(),
                     })
-                    .collect()
-            } else {
-                vec![json!({
-                    "id": format!("msg_{id}"),
-                    "type": "message",
-                    "role": "assistant",
-                    "status": "completed",
-                    "content": [{
-                        "type": "output_text",
-                        "text": clean_text,
-                        "annotations": []
-                    }]
-                })]
-            };
+                }));
+            } else if output_items.is_empty() {
+                output_items.push(plan_item);
+            }
 
             Json(json!({
                 "id": id,
@@ -1492,23 +1524,63 @@ async fn stream_responses(state: AppState, plan: RequestPlan) -> impl IntoRespon
         let (clean_text, calls) = yesman_model::parse_tool_calls(&full_text);
 
         if !calls.is_empty() {
+            // The model narrates its plan before calling a tool. Emit that
+            // text as a message item first; previously it was dropped and the
+            // client saw only an opaque function call.
+            let mut final_output: Vec<Value> = Vec::new();
+            let mut output_index = 0usize;
+            if !clean_text.is_empty() {
+                let msg_id = format!("msg_{id}");
+                let item = json!({
+                    "id": msg_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{
+                        "type": "output_text",
+                        "text": clean_text,
+                        "annotations": []
+                    }]
+                });
+                final_output.push(item.clone());
+                for event in ["response.output_item.added", "response.output_item.done"] {
+                    yield Ok::<Event, Infallible>(
+                        Event::default()
+                            .event(event)
+                            .data(
+                                json!({
+                                    "type": event,
+                                    "output_index": output_index,
+                                    "item": item,
+                                    "sequence_number": seq,
+                                })
+                                .to_string(),
+                            ),
+                    );
+                    seq += 1;
+                }
+                output_index += 1;
+            }
+
             for (i, c) in calls.into_iter().enumerate() {
                 let call_id = format!("call_{i}_{id}");
+                let item = json!({
+                    "id": call_id,
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": c.name,
+                    "arguments": c.arguments.to_string(),
+                    "status": "completed",
+                });
+                final_output.push(item.clone());
                 yield Ok::<Event, Infallible>(
                     Event::default()
                         .event("response.output_item.added")
                         .data(
                             json!({
                                 "type": "response.output_item.added",
-                                "output_index": i,
-                                "item": {
-                                    "id": call_id,
-                                    "type": "function_call",
-                                    "call_id": call_id,
-                                    "name": c.name,
-                                    "arguments": c.arguments.to_string(),
-                                    "status": "completed",
-                                },
+                                "output_index": output_index,
+                                "item": item,
                                 "sequence_number": seq,
                             })
                             .to_string(),
@@ -1522,21 +1594,15 @@ async fn stream_responses(state: AppState, plan: RequestPlan) -> impl IntoRespon
                         .data(
                             json!({
                                 "type": "response.output_item.done",
-                                "output_index": i,
-                                "item": {
-                                    "id": call_id,
-                                    "type": "function_call",
-                                    "call_id": call_id,
-                                    "name": c.name,
-                                    "arguments": c.arguments.to_string(),
-                                    "status": "completed",
-                                },
+                                "output_index": output_index,
+                                "item": item,
                                 "sequence_number": seq,
                             })
                             .to_string(),
                         ),
                 );
                 seq += 1;
+                output_index += 1;
             }
 
             yield Ok::<Event, Infallible>(
@@ -1551,7 +1617,7 @@ async fn stream_responses(state: AppState, plan: RequestPlan) -> impl IntoRespon
                                 "created_at": created,
                                 "status": "completed",
                                 "model": model_id,
-                                "output": [],
+                                "output": final_output,
                                 "usage": {
                                     "input_tokens": prompt_len,
                                     "output_tokens": seq,

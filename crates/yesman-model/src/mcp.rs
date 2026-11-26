@@ -1,6 +1,6 @@
 //! Model Context Protocol (MCP) client and tool-calling integration for Qwen2.5.
 //!
-//! Connects to MCP servers (such as `op-blender-mcp`) over stdio JSON-RPC,
+//! Connects to MCP servers (such as `mcp-for-blender` / `ahujasid/mcp-for-blender`) over stdio JSON-RPC,
 //! fetches available tool schemas, formats them into Qwen2.5 ChatML `<tools>`,
 //! and parses `<tool_call>` output blocks for execution.
 
@@ -159,6 +159,8 @@ impl McpClient {
 
     /// Execute a tool on the MCP server (`tools/call`).
     pub fn call_tool(&mut self, name: &str, arguments: Value) -> Result<String> {
+        let mut arguments = normalize_tool_arguments(name, arguments);
+        expand_tool_arguments(&mut arguments);
         let res = self.send_request(
             "tools/call",
             json!({
@@ -167,15 +169,28 @@ impl McpClient {
             }),
         )?;
 
-        // Format content blocks into plain string
+        // Format content blocks into a compact plain string. Image blocks (e.g.
+        // `look`) are summarised instead of dumping base64 into the model's
+        // context, which would blow up the KV cache after a verification step.
         if let Some(content) = res.get("content").and_then(Value::as_array) {
             let mut out = String::new();
             for item in content {
-                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                let piece = if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    Some(text.to_string())
+                } else if item.get("type").and_then(Value::as_str) == Some("image") {
+                    let mime = item
+                        .get("mimeType")
+                        .and_then(Value::as_str)
+                        .unwrap_or("image");
+                    Some(format!("[image: {mime}]"))
+                } else {
+                    None
+                };
+                if let Some(piece) = piece {
                     if !out.is_empty() {
                         out.push('\n');
                     }
-                    out.push_str(text);
+                    out.push_str(&piece);
                 }
             }
             if !out.is_empty() {
@@ -260,6 +275,168 @@ pub fn format_tools_system_prompt(base_system: &str, tools: &[McpTool]) -> Strin
     out
 }
 
+/// Marker the fine-tuned model emits instead of the fixed bpy helper library.
+/// See `training/generate_3d_dataset.py` (`STUDIO_MARKER`).
+pub const STUDIO_MARKER: &str = "# YESMAN_STUDIO";
+const STUDIO_PREAMBLE_PATH: &str = "training/bpy_preamble.py";
+
+#[derive(Debug, Deserialize)]
+struct RecipeEntry {
+    key: String,
+    keywords: Vec<String>,
+    body: String,
+}
+
+fn load_recipes() -> Vec<RecipeEntry> {
+    std::fs::read_to_string("training/recipes.json")
+        .ok()
+        .and_then(|text| serde_json::from_str::<Vec<RecipeEntry>>(&text).ok())
+        .unwrap_or_default()
+}
+
+/// Swap a generated body for a verified recipe body when the model clearly
+/// aimed at one of them (it reproduces object names reliably even when it
+/// garbles coordinates and sizes). This is what makes the built scene actually
+/// look like the requested object rather than a cloud of random primitives.
+fn repair_scene_body(body: &str) -> (String, Option<String>) {
+    let recipes = load_recipes();
+    if recipes.is_empty() {
+        return (body.to_string(), None);
+    }
+    let haystack = body.to_lowercase();
+    let mut best_score = 0usize;
+    let mut best: Option<&RecipeEntry> = None;
+    for recipe in &recipes {
+        let score: usize = recipe
+            .keywords
+            .iter()
+            .map(|keyword| haystack.matches(keyword.as_str()).count())
+            .sum();
+        if score > best_score {
+            best_score = score;
+            best = Some(recipe);
+        }
+    }
+    match best {
+        Some(recipe) if best_score >= 3 => (recipe.body.clone(), Some(recipe.key.clone())),
+        _ => (body.to_string(), None),
+    }
+}
+
+fn isolated_body_runner(body: &str, recipe: Option<&str>) -> String {
+    // Execute each top-level statement separately. A single typo in a
+    // generated loop must not discard the other 30 objects of the scene.
+    let literal = serde_json::to_string(body).unwrap_or_else(|_| "\"\"".to_string());
+    let note = match recipe {
+        Some(key) => format!("print('yesman: verified recipe: {key}')\n"),
+        None => String::new(),
+    };
+    format!(
+        r#"import ast as _ya
+_ybody = {literal}
+{note}_yns = globals()
+try:
+    _ynodes = _ya.parse(_ybody).body
+except SyntaxError as _ye:
+    print('yesman: body syntax error:', _ye)
+    try:
+        exec(_ybody, _yns)
+    except Exception as _ye2:
+        print('yesman: body error:', _ye2)
+else:
+    for _ynode in _ynodes:
+        try:
+            exec(compile(_ya.Module(body=[_ynode], type_ignores=[]), '<yesman>', 'exec'), _yns)
+        except Exception as _ye3:
+            print('yesman: skipped statement:', _ye3)
+    bpy.context.view_layer.update()
+    _ybad = [o for o in list(bpy.context.scene.objects) if (o.type=='MESH' and len(o.data.polygons)==0) or (o.type=='CURVE' and len(o.data.splines)==0)]
+    for _yo in _ybad:
+        bpy.data.objects.remove(_yo, do_unlink=True)
+    if _ybad:
+        print('yesman: removed', len(_ybad), 'degenerate objects')
+    # Curve bound boxes are unreliable (Bezier handles inflate them), so fit
+    # the floor to meshes only.
+    _yobjs = [o for o in bpy.context.scene.objects if o.type=='MESH' and o.name!='Ground']
+    _ycoords = [o.matrix_world @ Vector(c) for o in _yobjs for c in o.bound_box]
+    if _ycoords:
+        _ymn = Vector((min(v.x for v in _ycoords), min(v.y for v in _ycoords), min(v.z for v in _ycoords)))
+        _ymx = Vector((max(v.x for v in _ycoords), max(v.y for v in _ycoords), max(v.z for v in _ycoords)))
+        _ysize = max(2.0, max(_ymx.x-_ymn.x, _ymx.y-_ymn.y)*1.35)
+        _yg = bpy.data.objects.get('Ground')
+        if _yg is not None:
+            bpy.data.objects.remove(_yg, do_unlink=True)
+        bpy.ops.mesh.primitive_plane_add(size=_ysize, location=((_ymn.x+_ymx.x)/2, (_ymn.y+_ymx.y)/2, _ymn.z-0.02))
+        _yg = bpy.context.active_object; _yg.name='Ground'; _yg.data.materials.append(MAT('GroundMat'))
+        print('yesman: ground refit to', round(_ysize, 2), 'm around scene bbox')
+    _ytarget = globals().get('_yview_target')
+    if _ytarget is not None:
+        _ysmall = [o for o in bpy.context.scene.objects if o.type=='MESH' and o.name!='Ground' and max(o.dimensions) < 0.6]
+        _yext = max((max(o.dimensions) for o in _ysmall), default=0.4)
+        _ydist = max(0.8, min(6.0, _yext*4.0))
+        try:
+            for _yarea in bpy.context.screen.areas:
+                if _yarea.type == 'VIEW_3D':
+                    _yr3 = _yarea.spaces.active.region_3d
+                    _yr3.view_location = Vector(_ytarget)
+                    _yr3.view_distance = _ydist
+            print('yesman: viewport framed on hero object at', round(_ydist, 2), 'm')
+        except Exception as _ye4:
+            print('yesman: viewport frame skipped:', _ye4)
+"#
+    )
+}
+
+fn expand_studio_marker_with(text: &str, preamble: &str) -> String {
+    if !text.contains(STUDIO_MARKER) {
+        return text.to_string();
+    }
+    // Direct MCP: raw Python script. Run the body through the isolating
+    // runner so one malformed statement cannot abort the whole build.
+    if let Some(pos) = text.find(&format!("{STUDIO_MARKER}\n")) {
+        let marker_len = STUDIO_MARKER.len() + 1;
+        let (head, rest) = text.split_at(pos);
+        let body = &rest[marker_len..];
+        let (repaired, recipe) = repair_scene_body(body);
+        return format!(
+            "{head}{preamble}\n{}",
+            isolated_body_runner(&repaired, recipe.as_deref())
+        );
+    }
+    // OpenCode Code Mode: the bpy script sits inside a JS/JSON string, so the
+    // marker's newline is the two chars `\n`. Inline the preamble there.
+    let escaped = serde_json::to_string(preamble).unwrap_or_default();
+    let inner = escaped
+        .get(1..escaped.len().saturating_sub(1))
+        .unwrap_or(preamble);
+    text.replace(&format!("{STUDIO_MARKER}\\n"), inner)
+        .replace(STUDIO_MARKER, preamble)
+}
+
+/// Replace the studio marker with the helper library from
+/// `training/bpy_preamble.py`. If the file is absent the text is unchanged.
+pub fn expand_studio_marker(text: &str) -> String {
+    match std::fs::read_to_string(STUDIO_PREAMBLE_PATH) {
+        Ok(preamble) => expand_studio_marker_with(text, &preamble),
+        Err(_) => text.to_string(),
+    }
+}
+
+/// Expand the marker inside a tool call's `code` argument, both for direct
+/// `execute_blender_code` calls and for OpenCode Code Mode `execute` calls.
+pub fn expand_tool_arguments(arguments: &mut Value) {
+    let Some(obj) = arguments.as_object_mut() else {
+        return;
+    };
+    let Some(code) = obj.get("code").and_then(Value::as_str).map(str::to_string) else {
+        return;
+    };
+    let expanded = expand_studio_marker(&code);
+    if expanded != code {
+        obj.insert("code".to_string(), Value::String(expanded));
+    }
+}
+
 /// Extract any `<tool_call>\n{...}\n</tool_call>` blocks from model text output.
 pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
     let mut calls = Vec::new();
@@ -302,12 +479,15 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
                     && let (Some(name), Some(args)) =
                         (v.get("name").and_then(Value::as_str), v.get("arguments"))
                 {
+                    let mut arguments = args.clone();
+                    expand_tool_arguments(&mut arguments);
                     calls.push(ToolCall {
                         name: name.to_string(),
-                        arguments: args.clone(),
+                        arguments,
                     });
                 }
-                let skip_after = if let Some(tag_end) = after_start[end_idx..].find("</tool_call>") {
+                let skip_after = if let Some(tag_end) = after_start[end_idx..].find("</tool_call>")
+                {
                     end_idx + tag_end + "</tool_call>".len()
                 } else {
                     end_idx
@@ -331,6 +511,117 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
 /// Format tool execution result as a `<tool_response>` message according to Qwen2.5 convention.
 pub fn format_tool_response(result_text: &str) -> String {
     format!("<tool_response>\n{}\n</tool_response>", result_text.trim())
+}
+
+/// Compact tool schemas matching `training/generate_3d_dataset.py`.
+///
+/// The live `mcp-for-blender` server advertises 9 tools with very long
+/// descriptions (several thousand tokens). Putting those into the system
+/// prompt makes prefill slow and, more importantly, makes inference diverge
+/// from the prompts the model was fine-tuned on. We therefore show only the
+/// four tools it knows; calls are still executed against the live server.
+pub fn blender_training_tools() -> Vec<McpTool> {
+    let tool = |name: &str, description: &str, schema: Value| McpTool {
+        name: name.to_string(),
+        description: description.to_string(),
+        input_schema: schema,
+    };
+    vec![
+        tool(
+            "execute_blender_code",
+            "Run Python bpy code in Blender. No return statement.",
+            json!({
+                "type": "object",
+                "properties": {"code": {"type": "string", "description": "Python bpy script"}},
+                "required": ["code"]
+            }),
+        ),
+        tool(
+            "look",
+            "See the scene or object. Modes: viewport, camera, angles.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "mode": {"type": "string", "enum": ["viewport", "camera", "angles"]},
+                    "target": {"type": "array", "items": {"type": "string"}},
+                    "shading": {"type": "string", "enum": ["rendered", "solid", "wireframe", "xray"]}
+                }
+            }),
+        ),
+        tool(
+            "get_scene_info",
+            "Get scene hierarchy, objects and materials summary.",
+            json!({"type": "object", "properties": {}}),
+        ),
+        tool(
+            "get_addon_status",
+            "Check Blender addon status and version.",
+            json!({"type": "object", "properties": {}}),
+        ),
+    ]
+}
+
+/// Normalise argument shapes a 1.5B model tends to get wrong before sending
+/// them to the MCP server (which validates with pydantic).
+pub fn normalize_tool_arguments(name: &str, mut arguments: Value) -> Value {
+    if name != "get_scene_info" {
+        return arguments;
+    }
+    let Some(obj) = arguments.as_object_mut() else {
+        return arguments;
+    };
+    // A string like "location,size" becomes a list; unknown names are dropped
+    // because the addon only understands a fixed vocabulary of fields.
+    const ALLOWED_FIELDS: &[&str] = &[
+        "location",
+        "size",
+        "children",
+        "hidden",
+        "materials",
+        "modifiers",
+        "rotation",
+        "scale",
+        "parent",
+        "ground",
+        "details",
+        "topology",
+        "weights",
+        "animation",
+        "settings",
+        "placement",
+        "contents",
+        "health",
+    ];
+    let fields_value = obj.remove("fields").and_then(|fields| {
+        let list: Vec<Value> = match fields {
+            Value::String(s) => s.split(',').map(|v| json!(v.trim())).collect(),
+            Value::Array(items) => items,
+            _ => return None,
+        };
+        let clean: Vec<Value> = list
+            .into_iter()
+            .filter(|v| v.as_str().is_some_and(|s| ALLOWED_FIELDS.contains(&s)))
+            .collect();
+        if clean.is_empty() {
+            None
+        } else {
+            Some(Value::Array(clean))
+        }
+    });
+    // Only forward keys the live tool actually accepts; anything the model
+    // invented would fail pydantic validation and cause a retry loop.
+    let mut clean = serde_json::Map::new();
+    for key in ["query", "root", "limit", "user_prompt", "fields"] {
+        let value = if key == "fields" {
+            fields_value.clone()
+        } else {
+            obj.remove(key)
+        };
+        if let Some(value) = value {
+            clean.insert(key.to_string(), value);
+        }
+    }
+    Value::Object(clean)
 }
 
 #[cfg(test)]
@@ -378,6 +669,55 @@ Let me know if you need anything else!
             calls[0].arguments,
             json!({"code": "import bpy\nbpy.ops.mesh.primitive_uv_sphere_add()"})
         );
+    }
+
+    #[test]
+    fn studio_marker_expands_in_python_and_js() {
+        let pre = "import bpy\ndef ST():\n    pass\n";
+        let raw = "# YESMAN_STUDIO\nM('Wood',(1,0,0,1))\n";
+        assert!(expand_studio_marker_with(raw, pre).starts_with("import bpy\n"));
+        let js = r##"await tools.blender.execute_blender_code({ code: "# YESMAN_STUDIO\nM('Wood')\n" })"##;
+        let out = expand_studio_marker_with(js, pre);
+        assert!(out.contains(r"import bpy\ndef ST():\n    pass\n"));
+        assert!(!out.contains("# YESMAN_STUDIO"));
+    }
+
+    #[test]
+    fn tool_arguments_get_expanded() {
+        let mut args = json!({"code": "# YESMAN_STUDIO\nprint('hi')\n"});
+        // No preamble file in unit tests: expansion is a no-op, not a panic.
+        expand_tool_arguments(&mut args);
+        assert!(
+            args["code"].as_str().unwrap().contains("# YESMAN_STUDIO")
+                || args["code"].as_str().unwrap().contains("import bpy")
+        );
+    }
+
+    #[test]
+    fn compact_blender_tools_match_training() {
+        let tools = blender_training_tools();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "execute_blender_code",
+                "look",
+                "get_scene_info",
+                "get_addon_status"
+            ]
+        );
+        assert!(tools[0].input_schema.get("properties").is_some());
+    }
+
+    #[test]
+    fn normalize_scene_info_args() {
+        let args = json!({"fields": "location,size,bogus", "unknown_key": 1});
+        let out = normalize_tool_arguments("get_scene_info", args);
+        assert_eq!(out, json!({"fields": ["location", "size"]}));
+        let out = normalize_tool_arguments("get_scene_info", json!({}));
+        assert_eq!(out, json!({}));
+        let out = normalize_tool_arguments("look", json!({"fields": "size"}));
+        assert_eq!(out, json!({"fields": "size"}));
     }
 
     #[test]

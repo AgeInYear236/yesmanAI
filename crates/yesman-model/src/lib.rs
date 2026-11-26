@@ -12,8 +12,8 @@ pub mod tokenizer;
 pub use config::{Config, GenerationConfig};
 pub use generate::{GenerateOptions, chat_once, generate};
 pub use mcp::{
-    McpClient, McpTool, ToolCall, format_tool_response, format_tools_system_prompt,
-    parse_tool_calls,
+    McpClient, McpTool, ToolCall, blender_training_tools, format_tool_response,
+    format_tools_system_prompt, normalize_tool_arguments, parse_tool_calls,
 };
 pub use qwen2::{DType, PREFILL_CHUNK, Qwen2, Qwen2Weights};
 pub use sampler::Sampler;
